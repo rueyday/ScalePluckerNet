@@ -130,6 +130,14 @@ Support is unchanged: still full SO(3), still 8.8% of pairs above 150 deg.
     KITTI mono_best (s 8-42, rot<=12)    10.4%   14.7%
     median rotation                       80.0    32.3 deg
 
+`LOCAL=1` (opt-in) makes SPATIAL LOCALITY a regime axis. Measured: only
+`street_submap` concentrated its correspondences (0.28 of the reference
+radius); the generic `submap` scenario was 0.98, i.e. scattered -- it modelled
+a submap as fewer query lines, not as a localized region of a bigger cloud.
+LOCAL lets any pool be drawn windowed (`LOCAL_P`=0.25) with the reference
+forced 2.5-8x the query, taking submap-regime pairs from 7.8% to 28.8% of the
+mix across all structure types rather than streets only.
+
 The generator COVERS the deployment regimes; it is never CALIBRATED to them.
 The claim is zero-shot, so measuring a target dataset's regime is a legitimate
 check that the cell is populated, but must not become a loop that reshapes the

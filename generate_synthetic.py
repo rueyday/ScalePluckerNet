@@ -140,6 +140,20 @@ _ROT_CAL = bool(int(os.environ.get('ROT_CAL', '0')))
 # This is importance sampling, not benchmark fitting: nothing is removed from
 # the support, density is added where the method is deployed.
 _SOUND = bool(int(os.environ.get('SOUND', '0')))
+
+# LOCAL=1 : spatial locality as a REGIME AXIS rather than one scenario.
+# MEASURED 2026-09-05: of 17 scenarios only `street_submap` concentrates its
+# correspondences (0.28 = matched ref lines span 28% of the reference radius);
+# every other scenario sits at ~1.00, i.e. matches scattered over the WHOLE
+# reference. The generic `submap` scenario is 0.98 -- it models a submap as
+# size asymmetry (few query lines) and NOT as spatial locality, which is the
+# thing that actually makes submap registration hard: a small cloud matching a
+# LOCALIZED REGION of a much bigger, otherwise-outlier cloud.
+# LOCAL generalizes the street windowing to any pool, so the network sees that
+# regime with indoor/manhattan/building structure too, not only streets.
+_LOCAL = bool(int(os.environ.get('LOCAL', '0')))
+# probability that a non-street scenario is drawn in windowed (submap) mode
+_LOCAL_P = float(os.environ.get('LOCAL_P', '0.25'))
 # BROAD=1: train on SET broad ranges (rotation, noise severity) that cover the
 # realistic cross-modal regime with margin, INSTEAD of statistics calibrated to
 # the benchmark. Stronger paper argument (we bound the regime, not fit it) and a
@@ -1198,7 +1212,8 @@ _SPEC = {
     'room':        dict(pool='mixed',   size=('ratio', 80, 1100, 0.3, 3.0, 30, 1100),
                         ovl=(3.0, 2.0), **_INDOOR_CLEAN),
     'submap':      dict(pool='mixed',   size=('nested', 30, 150, 80, 700),
-                        ovl=(2.5, 3.5), nz1=(0.010, 0.15), nz2=(0.001, 0.04)),
+                        ovl=(2.5, 3.5), nz1=(0.010, 0.15), nz2=(0.001, 0.04),
+                        win=(0.15, 0.40)),   # LOCAL=1 only; see _LOCAL
     'relocalize':  dict(pool='mixed',   size=('logbase', 30, 400, 0.5, 2.0),
                         ovl=(2.5, 2.5), nz1=(0.005, 0.10), nz2='same'),
     'loop':        dict(pool='mixed',   size=('equal', 40, 500),
@@ -1218,7 +1233,8 @@ _SPEC = {
     'outdoor':     dict(pool='outdoor', size=('ratio', 60, 500, 0.2, 2.0, 30, 500),
                         ovl=(2.5, 2.0), nz1=(0.02, 0.60), nz2=(0.005, 0.20)),
     'street':      dict(pool='street',  size=None, ovl=None, nz1=0.3, nz2=0.1),
-    'street_submap':dict(pool='street_submap', size=None, ovl=None, nz1=0.3, nz2=0.1),
+    'street_submap':dict(pool='street_submap', size=None, ovl=None, nz1=0.3, nz2=0.1,
+                        win=(0.12, 0.30), win_always=True),
     'street_mono': dict(pool='street',  size=('indep', 300, 3300, 300, 5600),
                         ovl=(2.0, 9.0), nz1=0.3, nz2=0.1),
     'building':    dict(pool='building',  **_BUILDING),
@@ -1255,7 +1271,7 @@ def _logu(rng):
 
 
 def _sample_scenario():
-    """-> (scenario, n1, n2, overlap_frac, noise1, noise2, pool_type, confusers)"""
+    """-> (scenario, n1, n2, overlap, nz1, nz2, pool_type, confusers, window)"""
     name = np.random.choice(_SCENARIOS, p=_SCENARIO_P)
     sp = _SPEC[name]
     size, ovl = sp['size'], sp['ovl']
@@ -1265,15 +1281,31 @@ def _sample_scenario():
     nz1 = sp['nz1'] if np.isscalar(sp['nz1']) else _logu(sp['nz1'])
     nz2 = nz1 if sp['nz2'] == 'same' else (
         sp['nz2'] if np.isscalar(sp['nz2']) else _logu(sp['nz2']))
+    # spatial window (submap regime). Scenarios with win_always keep their
+    # historical behaviour; LOCAL=1 additionally offers it to any other pool.
+    win = sp.get('win')
+    if win is not None and not sp.get('win_always'):
+        win = win if (_LOCAL and np.random.random() < _LOCAL_P) else None
+    if win is None and _LOCAL and not sp.get('win_always'):
+        if np.random.random() < _LOCAL_P:
+            win = (0.15, 0.40)
+    if win is not None and not sp.get('win_always'):
+        # A submap is a SMALL cloud against a BIG, mostly-outlier cloud, with
+        # its correspondences confined to one region of that cloud. Windowing
+        # alone only supplies the second half, so shrink the query relative to
+        # the reference too -- otherwise `room`-in-window is a localized patch
+        # of a same-size map, which is not the regime that is hard.
+        n2 = max(n2, int(n1 * np.random.uniform(2.5, 8.0)))
+        n1 = max(30, min(n1, int(n2 * np.random.uniform(0.08, 0.35))))
     return (name, n1, n2, float(np.random.beta(*ovl)), nz1, nz2,
-            sp['pool'], sp.get('conf', False))
+            sp['pool'], sp.get('conf', False), win)
 
 
 # ── Pair generator ────────────────────────────────────────────────────────────
 
 def _generate_pair() -> dict:
     (scenario, n1, n2, overlap_frac, noise1, noise2,
-     pool_type, use_confusers) = _sample_scenario()
+     pool_type, use_confusers, window) = _sample_scenario()
 
     k  = max(_MIN_INLIERS, int(overlap_frac * min(n1, n2)))
     n1 = max(n1, k)
@@ -1381,7 +1413,7 @@ def _generate_pair() -> dict:
         if sv[-1] / (sv[0] + 1e-9) >= _NONDEGEN_THR:
             break
 
-    if pool_type == 'street_submap':
+    if window is not None:
         # v7: confine ALL query material (inliers + outliers) to one
         # contiguous spatial window of the street; the reference keeps the
         # whole route. A ball around a route point is a segment of the 1-D
@@ -1392,7 +1424,7 @@ def _generate_pair() -> dict:
         ctr = np.median(p0, axis=0)
         ext = float(np.linalg.norm(p0 - ctr, axis=1).max()) + 1e-6
         anchor = p0[np.random.randint(len(p0))]
-        rho = np.random.uniform(0.12, 0.30) * ext
+        rho = np.random.uniform(*window) * ext
         win = np.linalg.norm(p0 - anchor, axis=1) < rho
         while win.sum() < 3 * _MIN_INLIERS and rho < 2.5 * ext:
             rho *= 1.4
@@ -1623,7 +1655,8 @@ def main():
               f'all {len(_SCENARIOS)} scenarios')
         print(f'Flags: FOUND={_FOUND} INDOOR={_INDOOR} MONO={_MONO} GHOST={_GHOST} '
               f'SUBCAL={_SUBCAL} DEALIAS={_DEALIAS} KITTI_MONO={_KITTI_MONO} '
-              f'SOUND={_SOUND}')
+              f'SOUND={_SOUND} LOCAL={_LOCAL}'
+              + (f' LOCAL_P={_LOCAL_P}' if _LOCAL else ''))
     else:
         print(f'Scale distribution: LogNormal(log({np.exp(_SCALE_LOG_CENTER):.1f}), {_SCALE_LOG_STD}) '
               f'clipped to {_SCALE_RANGE}   [BROAD={_BROAD} KITTI_MONO={_KITTI_MONO}]')
