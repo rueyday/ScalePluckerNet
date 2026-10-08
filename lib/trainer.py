@@ -150,9 +150,15 @@ class Sim3Trainer:
         if self.test_valid:
             with torch.no_grad():
                 val_dict = self._valid_epoch()
+            # Log the start-of-training validation AT THE EPOCH TRAINING STARTS
+            # FROM, not a hardcoded 0. On a fresh run start_epoch is 0, so nothing
+            # changes; on a RESUME the old code planted the current val at epoch 0
+            # -- on v74_simple W&B holds such points at steps 31869 and 32941 --
+            # and any chart with an `epoch` x-axis drew its line back to the left
+            # edge every time the run was resumed.
             for k, v in val_dict.items():
                 if np.isfinite(v):
-                    self.writer.add_scalar(f'val/{k}', v, 0)
+                    self.writer.add_scalar(f'val/{k}', v, self.start_epoch)
 
         for epoch in range(self.start_epoch, self.max_epoch + 1):
             lr = self.scheduler.get_last_lr()
@@ -205,6 +211,9 @@ class Sim3Trainer:
         self.model.train()
         total_loss, total_num = 0.0, 0.0
 
+        bs = getattr(self.data_loader, 'batch_sampler', None)
+        if hasattr(bs, 'start_epoch'):
+            bs.start_epoch(epoch)       # live buffer swap BEFORE workers fork
         data_loader_iter = iter(self.data_loader)
         iter_size  = self.iter_size
         start_iter = (epoch - 1) * max(1, (getattr(self.data_loader, 'epoch_samples', None)
@@ -232,13 +241,23 @@ class Sim3Trainer:
             total_timer.tic()
 
             acc = 0
+            exhausted = False
             while acc < iter_size:
                 data_timer.tic()
                 try:
                     matches, plucker1, plucker2, *_ = next(data_loader_iter)
                 except StopIteration:
-                    data_loader_iter = iter(self.data_loader)
-                    matches, plucker1, plucker2, *_ = next(data_loader_iter)
+                    # Bucketed batches carry up to iter_size samples each, so
+                    # a step overshoots by up to B-1 and the epoch's buffer
+                    # runs out ~15% early. Previously the loop re-created the
+                    # iterator here, which in live mode REGENERATED (blocking
+                    # on the prefetch, then eating part of the next buffer)
+                    # and, with loader workers, forked them against a stale
+                    # buffer (the v83 OOM). An epoch is one buffer: finish the
+                    # step with what we have and end the epoch.
+                    exhausted = True
+                    data_timer.toc(average=False)
+                    break
                 data_time += data_timer.toc(average=False)
 
                 matches  = matches.to(self.device, non_blocking=True)
@@ -260,6 +279,10 @@ class Sim3Trainer:
                 ).sum(dim=(-2, -1)).mean() * B
                 acc += B
 
+            if acc == 0:            # buffer ended exactly on a step boundary
+                logging.info(f'Train Epoch: {epoch} buffer exhausted after '
+                             f'{curr_iter} steps ({n_steps} nominal)')
+                break
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
 
@@ -282,7 +305,11 @@ class Sim3Trainer:
                 )
                 data_meter.reset()
                 total_timer.reset()
-    
+            if exhausted:
+                logging.info(f'Train Epoch: {epoch} buffer exhausted after '
+                             f'{curr_iter + 1} steps ({n_steps} nominal)')
+                break
+
     def _valid_epoch(self):
         self.model.eval()
         num_data   = 0

@@ -115,6 +115,12 @@ def parse_args():
                         'so BucketBatchSampler still works; the next is prefetched '
                         'asynchronously (192 pairs/s at 6 workers vs 62/s consumed).')
     p.add_argument('--live_workers', type=int, default=6)
+    p.add_argument('--live_loader_workers', type=int, default=0,
+                   help='DataLoader workers in --live mode (default 0 = main process). MEASURED '
+                        '2026-09-29 on v82: 0 workers cost 0.3-0.5 s of DataT per 32-sample '
+                        'iteration (dense match matrices + padding on the main thread); fork '
+                        'workers read the per-epoch buffer copy-on-write and are recreated each '
+                        'epoch (non-persistent), so they always see the fresh buffer.')
     p.add_argument('--val_epoch_freq', type=int, default=1,
                    help='run validation every N epochs (default 1). Validation '
                         'measured at only 4.8%% of epoch wall time, so 2 buys '
@@ -135,6 +141,10 @@ def parse_args():
                    help='checkpoint to initialize WEIGHTS from (fresh '
                         'optimizer/scheduler/epoch counter — unlike --resume). '
                         'For warm-starting on a new dataset mix.')
+    # ONE encoder. `graff` and `ordinal` remain in lib/model.py as LOAD-ONLY
+    # paths for v74/v19 and v84/v81 respectively, but new runs get ordinal_q.
+    p.add_argument('--encoder', default='ordinal_q', choices=['ordinal_q'],
+                   help='quantile-rank ordinal shape context (the shipped encoder)')
     p.add_argument('--match_w', type=float, default=0.0,
                    help='weight of the matchability loss on the Sinkhorn '
                         'marginal heads r/c (v21: 0.2). 0 = off (pre-v21).')
@@ -177,15 +187,26 @@ class BucketBatchSampler(torch.utils.data.Sampler):
             b = min(b, self.mem_budget // (n * n))
         return max(1, min(self.max_b, b))
 
-    def __iter__(self):
-        # LIVE: pull a fresh epoch of pairs and re-read their shapes. The
-        # buffer was prefetched during the previous epoch, so .regenerate()
-        # normally returns immediately.
+    def start_epoch(self, epoch):
+        """Call ONCE per epoch, BEFORE iter(loader) (the trainer does).
+
+        LIVE: swap in the prefetched buffer and re-read its shapes. This used
+        to live inside __iter__, which is WRONG with --live_loader_workers > 0
+        (2026-09-29, v83 OOM x3 at the same iteration): torch's DataLoader
+        calls iter(sampler) TWICE per iter(loader) -- once in __init__ before
+        it forks the workers and again in _reset() after -- so the second call
+        swapped the buffer in the parent only. The workers then served the OLD
+        buffer at indices the parent had bucketed by the NEW shapes:
+        mixed-shape buckets, zero-padded by variable_collate up to 2048 lines
+        at B=32 -> a 2 GiB attention tensor. __iter__ is now a pure function of
+        (shapes, epoch), so both calls yield the same batch list."""
+        self.epoch = int(epoch)
         if getattr(self, 'live_ds', None) is not None:
             self.live_ds.regenerate()
             self.shapes = self.live_ds.shapes()
+
+    def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
-        self.epoch += 1
         idx = rng.choice(len(self.shapes), self.epoch_size, replace=False)
         groups = {}
         for i in idx:
@@ -195,8 +216,7 @@ class BucketBatchSampler(torch.utils.data.Sampler):
             B = self._batch_size(n1, n2)
             batches.extend(ids[j:j + B] for j in range(0, len(ids), B))
         order = rng.permutation(len(batches))
-        for j in order:
-            yield batches[j]
+        return iter([batches[j] for j in order])
 
     def __len__(self):
         # estimate; the trainer paces itself by loader.epoch_samples
@@ -259,6 +279,7 @@ def main():
         pose_loss_weight   = args.pose_loss,
         resume             = args.resume,
         match_w            = args.match_w,
+        encoder            = args.encoder,
     )
 
     if configs.train_seed is not None:
@@ -304,7 +325,7 @@ def main():
                                      mem_budget=getattr(configs, 'mem_budget', 0),
                                      seed=configs.train_seed or 0)
         if args.live:
-            # the sampler refreshes the buffer + shapes at each __iter__
+            # the trainer calls sampler.start_epoch() -> buffer swap + shapes
             sampler.live_ds = train_dataset
             sampler.epoch_size = min(epoch_size, len(train_dataset))
         logging.info(f'  bucket_batch: {n_shapes} distinct shapes, '
@@ -312,7 +333,7 @@ def main():
         train_loader = DataLoader(
             train_dataset,
             batch_sampler=sampler,
-            num_workers=(0 if args.live else args.workers), pin_memory=True,
+            num_workers=(args.live_loader_workers if args.live else args.workers), pin_memory=True,
             persistent_workers=(args.workers > 0 and not args.live),
             collate_fn=variable_collate,
         )
@@ -402,11 +423,17 @@ def main():
         # incompatible, so we reconstruct rather than load it). initial_lr was
         # set on every param group above, which cosine needs as its base_lr.
         cos_last_epoch = (trainer.start_epoch - 1) if args.resume else -1
+        # T_0 = epochs + 1, NOT epochs: the trainer runs epochs 0..epochs
+        # INCLUSIVE (range(start, max_epoch + 1)), and WarmRestarts wraps
+        # T_cur to 0 when epoch == T_0, so with T_0 = epochs the LAST epoch
+        # trained at the full base LR (v84_cos: "Epoch: 200, LR: [0.0005]",
+        # val 20.7 -> 16.9; same dip at epoch 10 of the 10-epoch chain).
+        # best_val was unaffected; checkpoint.pth of that last epoch was.
         trainer.scheduler = lr_sched.CosineAnnealingWarmRestarts(
-            trainer.optimizer, T_0=args.epochs, T_mult=1, eta_min=1e-6,
+            trainer.optimizer, T_0=args.epochs + 1, T_mult=1, eta_min=1e-6,
             last_epoch=cos_last_epoch,
         )
-        logging.info(f'Scheduler: CosineAnnealingWarmRestarts(T_0={args.epochs}, '
+        logging.info(f'Scheduler: CosineAnnealingWarmRestarts(T_0={args.epochs + 1}, '
                      f'T_mult=1, eta_min=1e-6, last_epoch={cos_last_epoch})')
 
     trainer.train()

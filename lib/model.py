@@ -324,14 +324,235 @@ class conv_in_graff(nn.Module):
         return self.mlp_fuse(self.conv_fuse(edge).mean(dim=-1))
 
 
+class conv_in_order(nn.Module):
+    """EXACTLY Sim(3)-invariant input encoder (v77, Ruey's proposal 2026-09-27).
+
+    The graff encoder is scale-invariant only by COVERAGE: vec(P) carries raw
+    positions (rawgeo), so the network learned the training scale range and
+    collapses outside it (12% retention at ~50x). This encoder uses NO length
+    scale at all -- no per-cloud sigma, no distance ratios:
+
+      graph     k nearest lines by distance between perpendicular offsets q from
+                the Sim(3)-EQUIVARIANT centre c (graff_stats). A uniform scale
+                multiplies every distance, so the ORDER of neighbours is
+                invariant; the order is the only closeness information kept.
+      features  per neighbour rank r = 1..k, ANGLES only (all squared cosines,
+                hence sign-invariant): cos^2(d_i, d_j), cos^2(d_i, u_ij),
+                cos^2(d_j, u_ij) with u_ij the unit offset direction q_j - q_i,
+                plus the rank itself. Angles are invariant under any similarity.
+      pooling   ORDER-AWARE: the k rank slots are concatenated, not averaged, so
+                "the 2nd-nearest line is perpendicular" is a different feature
+                from "the 7th-nearest is".
+
+    For a cloud and its Sim(3) image the node features are IDENTICAL given the
+    same neighbour order (unit-tested), so the training scale range stops being
+    a hyper-parameter and s~80 submaps are in-distribution by construction.
+    What is NOT invariant: the neighbour set under partial overlap / different
+    sensors (the centre c shifts, lines are missing) -- that robustness still
+    comes from data, as before.
+    """
+
+    KNN_K = 10
+    EDGE_CH = 4
+    WIDTH = 32
+
+    def __init__(self, out_channel: int, pool: str = 'concat', k: int = 10, graph: str = 'offset'):
+        super().__init__()
+        # graph='g24' (v80): neighbours ORDERED by the sigma-normalised G(2,4)
+        # chordal distance (graff_knn_idx). sigma enters the ordering only, never
+        # a feature value, so whole-cloud Sim(3) invariance is exact. MEASURED
+        # 2026-09-27 on real pairs: this ordering is the best preserved across
+        # modalities (Spearman 0.81 over matched lines) and angle statistics over
+        # k~80 such neighbours reach raw AUC 0.72 vs 0.59 at k=10 -- the local
+        # top-10 is dominated by lines the other sensor never saw.
+        self.KNN_K = k
+        self.graph = graph
+        # pool='concat': rank SLOTS (v77, Ruey's proposal). pool='mean' (v78):
+        # permutation-invariant mean over neighbours with the rank as a soft
+        # input channel -- MEASURED 2026-09-27 on 25 ScanNet++ pairs that a true
+        # cross-modal correspondence shares only 1.4 of its 10 neighbours across
+        # the two maps (rank tau 0.24), so slot-aligned features mostly compare
+        # unrelated lines; the mean keeps the exact scale invariance and the
+        # closeness ORDER (via the rank channel) without slot alignment.
+        # pool='star' (v79): mean-pooled edge features PLUS an angular shape
+        # context of the neighbourhood -- the sorted cosines between the unit
+        # offset directions u_ij, u_ik of all neighbour pairs (k(k-1)/2 values).
+        # Still no length scale anywhere; adds the SHAPE of the constellation,
+        # which angle-only edge features lack on Manhattan scenes (v78 flat ~1%).
+        self.pool = pool
+        self.conv_edge = nn.Conv2d(self.EDGE_CH, self.WIDTH, 1)
+        width = (self.WIDTH * self.KNN_K if pool == 'concat' else
+                 self.WIDTH + self.KNN_K * (self.KNN_K - 1) // 2 if pool == 'star' else self.WIDTH)
+        self.mlp_node = MLP([width, out_channel, out_channel, out_channel])
+
+    @staticmethod
+    def offsets(raw):
+        """Perpendicular offsets q (B,3,N) of every line from the equivariant centre."""
+        d = F.normalize(raw[:, 3:], dim=1)
+        p0 = torch.cross(d, raw[:, :3], dim=1)
+        c, _ = graff_stats(raw)
+        dp = p0 - c
+        return d, dp - d * (d * dp).sum(1, keepdim=True)
+
+    def forward(self, x, raw=None):
+        assert raw is not None, 'order encoder needs the raw [m;d] input'
+        d, q = self.offsets(raw)                                   # (B,3,N)
+        B, _, N = q.shape
+        k = min(self.KNN_K, N - 1)
+        if self.graph == 'g24':
+            idx = graff_knn_idx(raw, k + 1)[..., 1:]                # sigma-normalised G(2,4) ORDER, drop self
+        else:
+            idx = knn(q, k + 1)[..., 1:]                            # drop self (B,N,k)
+        if k < self.KNN_K:                                          # tiny clouds: repeat last
+            idx = torch.cat([idx, idx[..., -1:].expand(-1, -1, self.KNN_K - k)], -1)
+        k = self.KNN_K
+        flat = (idx + torch.arange(B, device=q.device).view(-1, 1, 1) * N).view(-1)
+        dT, qT = d.transpose(1, 2).reshape(B * N, 3), q.transpose(1, 2).reshape(B * N, 3)
+        dj = dT[flat].view(B, N, k, 3); qj = qT[flat].view(B, N, k, 3)
+        di = d.transpose(1, 2).unsqueeze(2); qi = q.transpose(1, 2).unsqueeze(2)   # (B,N,1,3)
+        u = F.normalize(qj - qi, dim=-1)
+        f = torch.stack([(di * dj).sum(-1) ** 2, (di * u).sum(-1) ** 2, (dj * u).sum(-1) ** 2,
+                         torch.linspace(0, 1, k, device=q.device).view(1, 1, k).expand(B, N, k)], 1)  # (B,4,N,k)
+        h = self.conv_edge(f)                                       # (B,32,N,k)
+        if self.pool == 'mean':
+            return self.mlp_node(h.mean(dim=-1))
+        if self.pool == 'star':
+            iu, ju = torch.triu_indices(k, k, 1, device=q.device)
+            star = (u[:, :, iu] * u[:, :, ju]).sum(-1)                  # (B,N,k(k-1)/2) cosines between offsets
+            star = star.sort(dim=-1, descending=True).values.transpose(1, 2)   # permutation-invariant
+            return self.mlp_node(torch.cat([h.mean(dim=-1), star], 1))
+        return self.mlp_node(h.permute(0, 1, 3, 2).reshape(B, self.WIDTH * k, N))
+
+
+class conv_in_ordinal(nn.Module):
+    """ORDINAL SHAPE CONTEXT over the WHOLE map (v81, 2026-09-28).
+
+    Every metric quantity is replaced by its RANK: the other lines are sorted by
+    the sigma-normalised G(2,4) chordal distance (the ordering only -- no
+    distance value is ever used), and angle statistics (mean and std of
+    cos^2(d_i,d_j), cos^2(d_i,u_ij), cos^2(d_j,u_ij)) are pooled inside FIXED,
+    log-spaced absolute-rank bins spanning nearest -> whole map. The result is
+    invariant not only to Sim(3) but to ANY monotone reparametrisation of the
+    distance (scale is the special case), is multi-scale by construction
+    (near bins local, far bins global), and has a fixed dimension for any N.
+    Measured 2026-09-27 on real pairs: raw AUC 0.74-0.77 vs 0.72-0.735 for the
+    k=80 mean (v80) and 0.59 for k=10 (v78). Cost: the same O(N^2) distance
+    matrix the k-NN already needs.
+
+    ABS bins are the v81 behaviour and are kept bit-identical. `frac=True`
+    (v88, `--encoder ordinal_q`) replaces them by QUANTILE bins -- edges are
+    fractions of the map, not absolute ranks. MEASURED DEFECT it fixes: with
+    absolute edges spanning to rank 4096, a 150-line query clamps every outer
+    bin to rank N-1 (so bins 5-8 are duplicates of "the whole map") while a
+    1500-line reference fills them for real. The two clouds therefore describe
+    DIFFERENT geometric supports and their descriptors are not comparable --
+    exactly the partial-overlap / "no global view" regime (submaps: reference
+    2413 lines vs query 241, a 10.8x size ratio, with ~1% of the reference
+    participating in any correspondence).
+    """
+
+    EDGES = (1, 3, 8, 20, 50, 125, 310, 780, 4096)      # 8 absolute rank bins
+    # Quantile edges as EXACT INTEGER fractions num/DEN of the map: 1/512,
+    # 1/128, 1/32, 1/8, 1/4, 1/2, 3/4, 1. They are integers on purpose --
+    # `torch.compile(dynamic=True)` (lib/trainer.py) makes N a SymInt, and a
+    # float `round(f * M)` on one forces symbolic FLOAT reasoning that hangs
+    # dynamo for tens of minutes before it ever reaches a training step
+    # (measured 2026-10-03). Integer `(num * M) // DEN` stays in SymInt
+    # arithmetic, which is what the absolute path's `min(const, N-1)` does and
+    # is why that one only ever cost 8 guards.
+    DEN = 512
+    NUMS = (1, 4, 16, 64, 128, 256, 384, 512)
+
+    def __init__(self, out_channel: int, frac: bool = False):
+        super().__init__()
+        self.frac = frac
+        nb = len(self.NUMS) if frac else len(self.EDGES) - 1
+        self.mlp_node = MLP([6 * nb, out_channel, out_channel, out_channel])
+
+    @staticmethod
+    @(torch._dynamo.disable if hasattr(torch, '_dynamo') else (lambda f: f))
+    def _bins_frac(N, nums, den):
+        """Quantile bin edges -- DELIBERATELY OUTSIDE THE COMPILED GRAPH.
+
+        `torch.compile(dynamic=True)` makes N a SymInt, and these 8 edges are
+        CHAINED (each starts where the previous ended), so tracing them builds a
+        nested min/max/FloorDiv expression tree 8 deep that sympy never finishes
+        reasoning about: measured 2026-10-03, the trainer sat 19 minutes after
+        the scheduler line without reaching a single step, and a standalone
+        torch.compile of this module alone did not return in 10 minutes. The
+        absolute path is cheap only because its edges are CONSTANTS, so each is
+        one flat `min(const, N-1)` guard.
+        Disabling dynamo here graph-breaks once per distinct N and specialises
+        the edges to plain ints; the gathers and einsums after them still
+        compile, and v81/v87 effectively ran this encoder eager anyway after
+        hitting `recompile_limit(8)`."""
+        M = max(int(N) - 1, 1)                           # neighbours available
+        out, prev = [], 1
+        for num in nums:                                 # strictly increasing, width >= 1
+            hi = min(M, max(prev + 1, (num * M) // den))
+            out.append((prev, hi))
+            prev = hi
+        return out
+
+    def _bins(self, N):
+        """(lo, hi) RANK pairs per bin. Absolute = the fixed v81 edges; quantile
+        = the same count of bins placed at fractions of the available N-1
+        neighbours, so the support is the same share of the map for any N."""
+        if not self.frac:
+            return list(zip(self.EDGES[:-1], self.EDGES[1:]))
+        return self._bins_frac(N, self.NUMS, self.DEN)
+
+    def forward(self, x, raw=None):
+        assert raw is not None
+        d, q = conv_in_order.offsets(raw)                          # (B,3,N)
+        B, _, N = q.shape
+        order = graff_knn_idx(raw, N)[..., 1:]                     # full G(2,4) ordering, self dropped (B,N,N-1)
+        dT, qT = d.transpose(1, 2), q.transpose(1, 2)              # (B,N,3)
+        feats = []
+        for lo, hi in self._bins(N):
+            lo_, hi_ = min(lo, N - 1), min(hi, N - 1)
+            if hi_ <= lo_:
+                lo_, hi_ = max(N - 2, 0), N - 1
+            idx = order[..., lo_ - 1:hi_]                          # (B,N,w)
+            flat = (idx + torch.arange(B, device=q.device).view(-1, 1, 1) * N).reshape(-1)
+            dj = dT.reshape(B * N, 3)[flat].view(B, N, -1, 3); qj = qT.reshape(B * N, 3)[flat].view(B, N, -1, 3)
+            u = F.normalize(qj - qT.unsqueeze(2), dim=-1)
+            a = torch.stack([(dT.unsqueeze(2) * dj).sum(-1) ** 2, (dT.unsqueeze(2) * u).sum(-1) ** 2, (dj * u).sum(-1) ** 2], 1)   # (B,3,N,w)
+            feats += [a.mean(-1), a.std(-1, unbiased=False)]
+        return self.mlp_node(torch.cat(feats, 1))                  # (B,48,N) -> (B,C,N)
+
+
 class FeatureExtractorGraph(nn.Module):
-    """Grassmannian encoder -> 12-layer self/cross attention GNN -> descriptors."""
+    """Input encoder (graff, or the exactly Sim(3)-invariant `order` variant, chosen
+    by config.encoder and recorded in the checkpoint) -> 12-layer self/cross
+    attention GNN -> descriptors."""
 
     def __init__(self, config, in_channel: int = 6):
         super().__init__()
         nc = config['descriptor_dim'] if 'descriptor_dim' in config \
             else config['net_nchannel']
-        self.conv_in = conv_in_graff(nc)
+        enc = config.get('encoder', 'graff') if hasattr(config, 'get') else getattr(config, 'encoder', 'graff')
+        # ONE SHIPPED ENCODER: `ordinal_q` -- the quantile-rank ordinal shape
+        # context (v89/v91/v92). It is the default and the only choice offered
+        # for NEW runs (train.py --encoder).
+        #
+        # `graff` and `ordinal` are kept LOAD-ONLY and must not be removed:
+        #   graff   -> v74_simple, whose correspondences feed EVERY baseline row
+        #              in the paper, plus v19_full (all older paper numbers)
+        #   ordinal -> v84_cos, the only checkpoint that has ever registered
+        #              KITTI submaps, and v81_ordinal, the quantile-bin control
+        # Deleting either would make those checkpoints load with randomly
+        # initialised weights and report plausible-looking numbers -- exactly
+        # the v41_graffenc failure (CLAUDE.md §2). `load_network` now RAISES on
+        # missing keys, which is the guard, but the architectures must exist.
+        #
+        # REMOVED 2026-10-07: order / order_mean / order_star / order_g24
+        # (v77-v80). Those length-free per-line kNN encoders plateaued at 1-3%
+        # and their checkpoints were deleted, so nothing can load them.
+        self.conv_in = (conv_in_ordinal(nc, frac=True) if enc in ('ordinal_q', '') else
+                        conv_in_ordinal(nc) if enc == 'ordinal' else
+                        conv_in_graff(nc) if enc == 'graff' else
+                        conv_in_ordinal(nc, frac=True))
         heads = int(config['attn_heads']) if 'attn_heads' in config else 4
         self.gnn = SpatialAttentionalGNN(nc, config['GNN_layers'], num_heads=heads)
         self.final_proj = nn.Conv1d(nc, nc, kernel_size=1, bias=True)

@@ -14,9 +14,11 @@ are no longer code.
   0. NORMALIZATION (Sim3Solver): both clouds scaled by alpha so the reference
      median foot radius is 1.  This is the SINGLE normalization in the system —
      the matcher consumes the same lines via `Sim3Solver.matcher_input()`.
-  1. top-K matcher pairs (K=200, LOAD-BEARING: 150/100 -> -4/-9 pairs) ->
-     nsamp random 2-line samples (LESS IS MORE: 2000 indoor / 4000 outdoor are
-     interior optima — more samples = more impostor exposure).
+  1. top-K matcher pairs (K=400 shipped; LOAD-BEARING and CELL-DEPENDENT —
+     see the defaults note below) -> nsamp random 2-line samples (8000
+     shipped).  "LESS IS MORE" (2000 > 4000 > 8000) was measured on the
+     RETIRED 37-pair 7-Scenes cell and does NOT hold on ScanNet++, where 8000
+     is the optimum — do not port that claim forward.
   2. SCALE-FREE SKEW OBSERVABILITY GATE, pre-solve: |(d1xd2).(f2-f1)| >
      skew_min x (per-cloud median foot radius), both clouds — two lines fix
      Sim(3) only if skew; near-coplanar pairs are scale-degenerate yet
@@ -36,13 +38,23 @@ are no longer code.
      by the inlier COUNT #(theta < tau) on the max principal angle theta
      between affine-Grassmann embeddings — position-aware, so it vetoes the
      direction-consistent flips that ordinary consensus accepts.  ONE
-     parameter: tau_deg = 2.5 indoor / 3 outdoor.  Argmax wins.  END.
+     parameter: tau_deg, which TRACKS THE CORRESPONDENCE NOISE FLOOR and is
+     therefore the one knob that must be re-checked per cell: 9 indoor
+     (ScanNet++, shipped), 3 outdoor (`SOLVE_SIM3_OUTDOOR`).  Argmax wins.
+  6. FINAL RE-SOLVE on the winner's inlier set (`_refit_inliers`,
+     refit_iters=1): re-run the same closed-form alternation on ALL G(2,4)
+     inliers of the selected hypothesis, and keep it only if the inlier count
+     does not drop.  Worth +26 succ on the 810-pair ScanNet++ cell.  END.
 
-TESTED AND REJECTED (do not re-add): refinement of any kind (Cauchy G(2,4)
-finite-difference, alternation-L2, R-locked LS, iterative re-gated LS — all
-lose to none; the residual translation error equals its line-observable
-projection, t_gr/t_e ~ 0.96, so it is correspondence-bound, not a manifold
-artifact); a scale prior or clamp (the position-aware criterion cannot reward
+PARTIALLY REVERSED 2026-10-07 — this list used to say "refinement of any
+kind" was rejected.  That remains true of refinement on the MINIMAL solve's
+own two correspondences (Cauchy G(2,4) finite-difference, alternation-L2,
+R-locked LS, iterative re-gated LS — all lose to none), but it is FALSE of
+re-solving on the selected hypothesis's whole INLIER SET, which is stage 6 and
+is shipped: the earlier rejection was measured when the winner was chosen from
+a pool so small that its inlier set added nothing.  See `_refit_inliers`.
+
+TESTED AND REJECTED (do not re-add): a scale prior or clamp (the position-aware criterion cannot reward
 collapsed scales); the graded 'prop' scoring kernel and the 3-rung tau ladder
 (indistinguishable over 8 seeds, and the count needs a far smaller
 indoor/outdoor tau gap with better outdoor scale); dropping the alpha
@@ -58,9 +70,17 @@ scrambled @5 13.6 vs 17.6).
 NOTE single-run differences of 1-3 pairs on 37 cases are WITHIN RANSAC seed
 noise (std ~2): compare configs over several `seed` values, never one run.
 
-v27 caches, CPU: 7-Scenes 20.2 +/- 2.3 @5 over seeds (23/37 at seed 0; rot med
-3.62 deg, <5 deg 28/37, s 4.6%, t 0.177 m) at ~80 ms/pair; KITTI mono_best 2/5
-with SOLVE_SIM3_OUTDOOR; submaps matcher-bound.
+SHIPPED NUMBERS (2026-10-07, v89 correspondences, the 810-pair ScanNet++
+cell, defaults above): succ 283 / succ10 379, e_R med 6.19 deg, e_t med
+1.059 m, e_s med 10.2%.  tau is the sensitive default — 4 / 6 / 9 give succ
+268 / 285 / 283 but e_R med 82.1 / 7.35 / 6.19, i.e. tau 6 buys two success
+cases by trading away the rotation median, so 9 ships.  KITTI mono_best and
+the submap quarters use `SOLVE_SIM3_OUTDOOR`; submaps are matcher-bound
+(the GT correspondence list itself holds only ~26 entries).
+
+The older 37-pair 7-Scenes cell is RETIRED (that benchmark's median relative
+rotation was ~2.9 deg, so it could not see any of the robustness properties
+above); its numbers were 20.2 +/- 2.3 @5 over seeds at ~80 ms/pair.
 """
 import numpy as np
 
@@ -459,9 +479,50 @@ def _score_g24_t(plq, plr, Rs, ts, ss, tau_rad, chunk=4096):
 # ── THE solver ──────────────────────────────────────────────────────────────
 
 
-def solve_sim3(solver, prob, topk=200, nsamp=2000, tau_deg=2.5,
-               skew_min=0.05, cost_max=0.12, alt_iters=3, seed=0,
-               device='cpu', gpu_dtype='float32'):
+
+def _refit_inliers(plq, plr, R, t, sc_, tau, iters=1):
+    """FINAL REFIT: one closed-form alternating step on ALL G(2,4) inliers of
+    the selected hypothesis (Ruey 2026-10-07).
+
+    SHIPPED 2026-10-07, and it CONTRADICTS this module's former "refinement of
+    any kind -- TESTED AND REJECTED" entry. That rejection was measured in the
+    v27 era on 7-Scenes and the old 810-pair cells with the graff matcher. On
+    the 500-scene ScanNet++ cell with v89 (ordinal_q) it is a large win, three
+    seeds, `tools/solver_lab.py` parity-verified bit-identical at refit=off:
+
+        topk   refit=off            refit=1 iter
+         200   286 rot<5 / 226 str  308 / 247
+         400   305 / 237            325 / 261     <- SHIPPED (interior optimum
+         600   314 / 251            329 / 263        on cost: 400->1000 adds
+        1000   307 / 254            331 / 266        only +6/+5 for 2.2x time)
+
+    ONE iteration is enough: 2 and 3 give 312/246 and 315/246 -- rot<5 creeps
+    but strict does not, and the median is flat at 3.44 from iteration 1.
+    A score-weighted variant was a wash (311/247).
+    The refit is REJECTED unless it does not lower the G(2,4) count, so it can
+    never trade consensus for a prettier residual.
+    It does NOTHING on KITTI submaps (6/10 at 6.87 deg either way) -- that cell
+    is matcher-starved (median 3 correct matches in the top-200), not
+    pose-limited.
+    """
+    dq_a, mq_a = plq[3:].T, plq[:3].T
+    dr_a, mr_a = plr[3:].T, plr[:3].T
+    fq_a, fr_a = _feet(dq_a, mq_a), _feet(dr_a, mr_a)
+    u = dq_a @ R.T
+    Yq = _yz_np(sc_ * (fq_a @ R.T) + t, u)
+    Yr = _yz_np(fr_a, dr_a)
+    inl = _s2_np(np.matmul(np.swapaxes(Yq, -2, -1), Yr)) > np.cos(tau)
+    if inl.sum() < 3:
+        return None
+    Rr, tr, sr, cr = _alternate(dq_a[inl][None], fq_a[inl][None],
+                                dr_a[inl][None], fr_a[inl][None],
+                                R[None], t[None], np.array([sc_]), iters)
+    return None if not np.isfinite(cr[0]) else (Rr, tr, sr)
+
+
+def solve_sim3(solver, prob, topk=400, nsamp=8000, tau_deg=9.0,
+               skew_min=0.3, cost_max=0.12, alt_iters=3, seed=0,
+               refit_iters=1, device='cpu', gpu_dtype='float32'):
     """THE Sim(3) estimate from a matcher probability matrix — the module
     docstring carries the pipeline, the frozen defaults and the rejected
     variants.  Defaults = INDOOR profile; OUTDOOR = `SOLVE_SIM3_OUTDOOR`.
@@ -520,9 +581,17 @@ def solve_sim3(solver, prob, topk=200, nsamp=2000, tau_deg=2.5,
         Rs, ts, ss = Rs[keep], ts[keep], ss[keep]
         if len(Rs) == 0:
             return np.eye(3), np.zeros(3), 1.0
-        sc = _score_g24(plq, plr, Rs, ts, ss, np.deg2rad(tau_deg))
+        tau = np.deg2rad(tau_deg)
+        sc = _score_g24(plq, plr, Rs, ts, ss, tau)
         bi = int(np.argmax(sc))
-        return Rs[bi], np.asarray(ts[bi]) / solver.alpha, float(ss[bi])
+        Rb, tb, sb = Rs[bi], np.asarray(ts[bi]), float(ss[bi])
+        if refit_iters > 0:
+            out = _refit_inliers(plq, plr, Rb, tb, sb, tau, refit_iters)
+            if out is not None:
+                Rr, tr, sr = out
+                if _score_g24(plq, plr, Rr, tr, sr, tau)[0] >= sc[bi]:
+                    Rb, tb, sb = Rr[0], np.asarray(tr[0]), float(sr[0])
+        return Rb, tb / solver.alpha, float(sb)
 
     torch = _torch()                                 # GPU backend
     dt = getattr(torch, gpu_dtype)
@@ -545,14 +614,31 @@ def solve_sim3(solver, prob, topk=200, nsamp=2000, tau_deg=2.5,
         Rs, ts, ss = to(Rs[keep]), to(ts[keep]), to(ss[keep])
     if len(Rs) == 0:
         return np.eye(3), np.zeros(3), 1.0
-    sc = _score_g24_t(to(plq), to(plr), Rs, ts, ss, np.deg2rad(tau_deg))
+    tau = np.deg2rad(tau_deg)
+    sc = _score_g24_t(to(plq), to(plr), Rs, ts, ss, tau)
     bi = int(torch.argmax(sc))
     R = Rs[bi].double().cpu().numpy()
     U, _, Vt = np.linalg.svd(R)          # fp32 drifts off SO(3) by ~1e-6;
     D = np.diag([1.0, 1.0, np.linalg.det(U @ Vt)])   # re-project so callers
-    return (U @ D @ Vt,                  # can rely on R being orthonormal
-            ts[bi].double().cpu().numpy() / solver.alpha,
-            float(ss[bi]))
+    Rb = U @ D @ Vt                      # can rely on R being orthonormal
+    tb = ts[bi].double().cpu().numpy()   # still in alpha units
+    sb = float(ss[bi])
+    # FINAL REFIT, mirrored from the CPU path (added 2026-10-07). Without this
+    # the GPU backend silently returned a DIFFERENT METHOD: ~26 fewer succ on
+    # the 810-pair cell, so any GPU-produced number or timing was not
+    # comparable to the CPU default. The refit itself runs in numpy -- it
+    # touches one hypothesis, not nsamp of them, so there is nothing to gain
+    # from the GPU, and sharing the CPU implementation keeps the two backends
+    # from drifting apart again. The accept/reject comparison uses the numpy
+    # scorer on BOTH sides so the guard is self-consistent.
+    if refit_iters > 0:
+        sc_before = _score_g24(plq, plr, Rb[None], tb[None], np.array([sb]), tau)[0]
+        out = _refit_inliers(plq, plr, Rb, tb, sb, tau, refit_iters)
+        if out is not None:
+            Rr, tr, sr = out
+            if _score_g24(plq, plr, Rr, tr, sr, tau)[0] >= sc_before:
+                Rb, tb, sb = Rr[0], np.asarray(tr[0]), float(sr[0])
+    return Rb, tb / solver.alpha, float(sb)
 
 
 # Outdoor/high-noise profile (KITTI mono_best-validated):
