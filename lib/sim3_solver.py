@@ -1,645 +1,163 @@
-"""sim3_solver.py — SCALAR's Sim(3) line-map registration solver, one file.
+"""
+Sim(3) registration of two Plücker line maps from matcher correspondences.
 
-    from lib.sim3_solver import Sim3Solver, solve_sim3
-    solver = Sim3Solver((q1, q2), (r1, r2))          # (N,3) endpoints each
-    R, t, s = solve_sim3(solver, prob)               # matcher prob (n_ref, n_q)
+    from lib.sim3_solver import solve_sim3
+    R, t, s = solve_sim3(p_q, p_r, prob)   # p_q (Nq,6), p_r (Nr,6) as [m; d]; prob (Nr, Nq)
 
-Lines are Plücker [m; d] (sign ambiguity [m;d] ~ [-m;-d]); positions are always
-foot points f = d x m (sign-invariant).  ONE pipeline, no variants — every
-stage and every default carries a controlled A/B recorded in the root
-CLAUDE.md (with the scratchpad_*.txt logs); the alternatives that lost are
-listed at the bottom of this docstring so they are not re-litigated, but they
-are no longer code.
-
-  0. NORMALIZATION (Sim3Solver): both clouds scaled by alpha so the reference
-     median foot radius is 1.  This is the SINGLE normalization in the system —
-     the matcher consumes the same lines via `Sim3Solver.matcher_input()`.
-  1. top-K matcher pairs (K=400 shipped; LOAD-BEARING and CELL-DEPENDENT —
-     see the defaults note below) -> nsamp random 2-line samples (8000
-     shipped).  "LESS IS MORE" (2000 > 4000 > 8000) was measured on the
-     RETIRED 37-pair 7-Scenes cell and does NOT hold on ScanNet++, where 8000
-     is the optimum — do not port that claim forward.
-  2. SCALE-FREE SKEW OBSERVABILITY GATE, pre-solve: |(d1xd2).(f2-f1)| >
-     skew_min x (per-cloud median foot radius), both clouds — two lines fix
-     Sim(3) only if skew; near-coplanar pairs are scale-degenerate yet
-     self-consistent (no residual test can catch them).  Rejected samples are
-     never solved.
-  3. MINIMAL SOLVE: query line 1 is hemisphere-canonicalized and BOTH signs of
-     line 2 are proposed (2 hypotheses/sample), letting G(2,4) arbitrate.
-     Each: SVD Procrustes on directions + joint 4x4 linear (t,s) from the
-     moment constraint, then alt_iters=3 closed-form alternating steps on the
-     Grassmann projection cost (`_alternate`, sign-invariant).  3 steps
-     suffice — the L2 init lands in-basin and 3 absorb the residual below the
-     ~8 deg correspondence noise floor (3 = 25 = 100 empirically).
-  4. CONSISTENCY FILTER: converged projection cost < 0.12 (8 constraints vs
-     7 DoF -> contaminated pairs cannot fit; quality-inert at every tested
-     threshold — retained purely to cut scoring cost).
-  5. G(2,4) SELECTION (`_score_g24`): every hypothesis scored over all K pairs
-     by the inlier COUNT #(theta < tau) on the max principal angle theta
-     between affine-Grassmann embeddings — position-aware, so it vetoes the
-     direction-consistent flips that ordinary consensus accepts.  ONE
-     parameter: tau_deg, which TRACKS THE CORRESPONDENCE NOISE FLOOR and is
-     therefore the one knob that must be re-checked per cell: 9 indoor
-     (ScanNet++, shipped), 3 outdoor (`SOLVE_SIM3_OUTDOOR`).  Argmax wins.
-  6. FINAL RE-SOLVE on the winner's inlier set (`_refit_inliers`,
-     refit_iters=1): re-run the same closed-form alternation on ALL G(2,4)
-     inliers of the selected hypothesis, and keep it only if the inlier count
-     does not drop.  Worth +26 succ on the 810-pair ScanNet++ cell.  END.
-
-PARTIALLY REVERSED 2026-10-07 — this list used to say "refinement of any
-kind" was rejected.  That remains true of refinement on the MINIMAL solve's
-own two correspondences (Cauchy G(2,4) finite-difference, alternation-L2,
-R-locked LS, iterative re-gated LS — all lose to none), but it is FALSE of
-re-solving on the selected hypothesis's whole INLIER SET, which is stage 6 and
-is shipped: the earlier rejection was measured when the winner was chosen from
-a pool so small that its inlier set added nothing.  See `_refit_inliers`.
-
-TESTED AND REJECTED (do not re-add): a scale prior or clamp (the position-aware criterion cannot reward
-collapsed scales); the graded 'prop' scoring kernel and the 3-rung tau ladder
-(indistinguishable over 8 seeds, and the count needs a far smaller
-indoor/outdoor tau gap with better outdoor scale); dropping the alpha
-normalization, or reusing the matcher's whitened frame (catastrophic on
-matcher-free outdoor sets — see Sim3Solver); 3-line and mixed 2L/3L minimal
-sets; residual-based sign selection ('res'/'res2'/'resa' — validated, but a
-wash, and its compute saving is capped at ~25% because random line-pair
-angles concentrate exactly where the residual test is blind); the per-line
-hemisphere canon for BOTH lines (~2x faster and tied on every shipped
-benchmark, but degrades badly under large relative rotation: 7-Scenes
-scrambled @5 13.6 vs 17.6).
-
-NOTE single-run differences of 1-3 pairs on 37 cases are WITHIN RANSAC seed
-noise (std ~2): compare configs over several `seed` values, never one run.
-
-SHIPPED NUMBERS (2026-10-07, v89 correspondences, the 810-pair ScanNet++
-cell, defaults above): succ 283 / succ10 379, e_R med 6.19 deg, e_t med
-1.059 m, e_s med 10.2%.  tau is the sensitive default — 4 / 6 / 9 give succ
-268 / 285 / 283 but e_R med 82.1 / 7.35 / 6.19, i.e. tau 6 buys two success
-cases by trading away the rotation median, so 9 ships.  KITTI mono_best and
-the submap quarters use `SOLVE_SIM3_OUTDOOR`; submaps are matcher-bound
-(the GT correspondence list itself holds only ~26 entries).
-
-The older 37-pair 7-Scenes cell is RETIRED (that benchmark's median relative
-rotation was ~2.9 deg, so it could not see any of the robustness properties
-above); its numbers were 20.2 +/- 2.3 @5 over seeds at ~80 ms/pair.
+The result maps query lines onto reference lines:  d_r = R d_q,  m_r = s R m_q + t x d_r.
 """
 import numpy as np
 
-# ── Plücker + the one scene normalization ───────────────────────────────────
+def _dir_foot(L):
+    """Plücker [m; d] (..., 6) -> unit direction d and foot point f = d x m """
+    d = L[..., 3:] / np.linalg.norm(L[..., 3:], axis=-1, keepdims=True)
+    return d, np.cross(d, L[..., :3])
 
+def _transform(d, f, R, t, s):
+    """Apply x -> s R x + t to lines (d, f) (K, 3) under H poses -> (H, K, 3) each."""
+    Rt = np.swapaxes(R, 1, 2)
+    d2 = d @ Rt
+    p = s[:, None, None] * (f @ Rt) + t[:, None, :]
+    return d2, p - d2 * (d2 * p).sum(-1, keepdims=True)
 
-def segments_to_plucker(p1, p2):
-    d = p2 - p1
-    d = d / (np.linalg.norm(d, axis=1, keepdims=True) + 1e-12)
-    m = np.cross((p1 + p2) * 0.5, d)
-    return np.concatenate([m, d], axis=1).astype(np.float32)
+def _basis(d, f):
+    """A line's point on G(2,4): the orthonormal 4x2 basis of span{[d; 0], [f; 1]} """
+    n = np.sqrt(1.0 + (f * f).sum(-1, keepdims=True))
+    z = np.zeros_like(n)
+    return np.stack([np.concatenate([d, z], -1), np.concatenate([f, 1.0 + z], -1) / n], -1)
 
+def _overlap(R, t, s, dq, fq, Yr):
+    """||Yq^T Yr||_F^2 for H poses x K correspondences -> (H, K). It is 2 when the
+    transformed query line coincides with its reference line; the projection distance is
+    ||Pq - Pr||_F^2 = 4 - 2 * overlap."""
+    Yq = _basis(*_transform(dq, fq, R, t, s))                  # (H, K, 4, 2)
+    return ((np.swapaxes(Yq, -1, -2) @ Yr) ** 2).sum((-2, -1))
 
-class Sim3Solver:
-    """Plücker conversion + THE scene normalization, shared with the matcher.
-
-    `alpha` = 1 / median reference foot-point radius; both clouds are scaled by
-    it, so `p_q`/`p_r` are the normalized Plücker lines the solver's thresholds
-    are calibrated in.  `matcher_input()` returns those SAME lines with the
-    moment whitening the network expects — the normalization is computed once
-    and the geometry is never scaled twice.  `solve_sim3` divides t by alpha,
-    so poses come back in the caller's metric frame.
-
-    Dropping alpha (raw metric units) was tried 2026-08-20 and REVERTED: on the
-    5-pair matcher-fed KITTI cache raw looked better (@5 0.6 -> 1.6), but on the
-    SAME maps with matcher-free correspondence sets it collapses — mono_best
-    15%: 5/30 -> 1/30, rot med 6.3 -> 63 deg; submap 15%: 10/70 -> 1/70.
-    Reusing the matcher's whitened frame instead is INTERMEDIATE and still
-    loses (mono 3/30, submap 4/70): that factor is alpha/std ~ alpha*s, which
-    normalizes the QUERY while the comparison happens in the REFERENCE frame,
-    leaving the target of the comparison s times too large.  The rule (verified
-    by frame swap): whichever cloud is the untransformed TARGET must sit at
-    unit scale.  Matcher-free @5 3-way (7S/mono/submap), tau retuned per cell:
-    alpha 58/5/10, raw 64/2/3, matcher-frame 60/3/4."""
-
-    def __init__(self, q_ends, r_ends):
-        q1, q2 = (np.asarray(a, float) for a in q_ends)
-        r1, r2 = (np.asarray(a, float) for a in r_ends)
-        pr_raw = segments_to_plucker(r1, r2)
-        f = np.cross(pr_raw[:, :3], pr_raw[:, 3:])
-        rad = float(np.median(np.linalg.norm(f - np.median(f, 0), axis=1)))
-        self.alpha = 1.0 / (rad + 1e-9)
-        self.q1, self.q2 = q1 * self.alpha, q2 * self.alpha
-        self.r1, self.r2 = r1 * self.alpha, r2 * self.alpha
-        self.p_q = segments_to_plucker(self.q1, self.q2)
-        self.p_r = segments_to_plucker(self.r1, self.r2)
-
-    def matcher_input(self):
-        """(p_q, p_r) as the network expects them: the already-alpha-normalized
-        Plücker lines with moments whitened by the QUERY moment std, applied to
-        BOTH clouds.  Reuses p_q/p_r — no second Plücker conversion, no second
-        scaling.
-
-        This whitening is the matcher's ONLY normalization, and it is NOT the
-        solver's alpha: alpha cancels here exactly (it scales the query moments
-        and their std by the same factor), so the matcher is invariant to the
-        choice of world units, while the query/reference scale RATIO survives.
-        Verified: scaling both clouds by 1e-2 or 1e2 leaves this output
-        identical to float32 noise.
-
-        THE HEMISPHERE CANON WAS REMOVED 2026-09-04.  It is a literal no-op for
-        the Grassmannian encoder: flipping [m;d] -> [-m;-d] is the SAME LINE, it
-        leaves p0 = d x m untouched and only sends c1 -> -c1, so the subspace
-        and hence P = Y Y^T are unchanged (measured 0.000e+00 under random
-        per-line flips).  Its only remaining effect was to perturb the whitening
-        std by ~0.14%.  The k-NN graph and graff_stats are sign-invariant too.
-        NOTE the SOLVER's own sign handling is a different thing and STAYS:
-        solve_sim3 canonicalizes query line 1 and proposes BOTH signs of line 2
-        for the G(2,4) criterion to arbitrate (see the module docstring).
-        """
-        std = float(self.p_q[:, :3].std()) + 1e-6
-
-        def w(p):
-            return np.concatenate([p[:, :3] / std, p[:, 3:]], 1).astype(np.float32)
-
-        return w(self.p_q), w(self.p_r)
-
-
-def canonicalize_sign(p):
-    """p: (N, 6) [m; d] -> hemisphere sign canon. Flip each 6-vector JOINTLY so
-    the largest-|component| of the DIRECTION (channels 3:6) is >= 0.
-
-    SHIPPED 2026-08-21 as the matcher's sign handling (replaces the sign-even
-    embedding `sign_inv`, which was REJECTED: rotation sweep gave 95.1% inlier
-    retention at 180 deg for the canon vs 53.2% for sign_inv). Idempotent, so
-    datasets with baked-in random flips are reused unchanged.
-
-    NOTE this is a MATCHER-side operation only. The solver must NEVER canon its
-    own lines: foot points f = d x m are ALREADY sign-invariant, and multiplying
-    them by a sign canon is a bug that once cost a 22 -> 17/37 misread.
-    """
-    d = p[:, 3:6]
-    idx = np.argmax(np.abs(d), axis=1)
-    sg = np.sign(d[np.arange(len(d)), idx])
-    sg[sg == 0] = 1.0
-    return p * sg[:, None]
-
+def _procrustes(Dq, Dr):
+    """Rotations best mapping directions Dq onto Dr (Kabsch): (NS, L, 3) -> (NS, 3, 3)."""
+    U, _, Vt = np.linalg.svd(np.einsum('nli,nlj->nij', Dr, Dq))
+    D = np.tile(np.eye(3), (len(U), 1, 1))
+    D[:, 2, 2] = np.linalg.det(U @ Vt)
+    return U @ D @ Vt
 
 def _skew(v):
-    return np.array([[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]])
+    x, y, z = v[..., 0], v[..., 1], v[..., 2]
+    o = np.zeros_like(x)
+    return np.stack([np.stack([o, -z, y], -1),
+                     np.stack([z, o, -x], -1),
+                     np.stack([-y, x, o], -1)], -2)
 
+def _solve_ts(dq, mq, dr, mr, R):
+    """(t, s) given R, by least squares on m_r = s R m_q + t x (R d_q) """
+    v = np.einsum('nij,nlj->nli', R, dq)
+    w = np.einsum('nij,nlj->nli', R, mq)
+    sg = np.where((v * dr).sum(-1, keepdims=True) < 0, -1.0, 1.0)
+    v, w = v * sg, w * sg
+    n, L = dq.shape[:2]
+    A = np.concatenate([-_skew(v), w[..., None]], -1).reshape(n, 3 * L, 4)  # t x v = -[v]_x t
+    b = mr.reshape(n, 3 * L, 1)
+    At = np.swapaxes(A, 1, 2)
+    x = np.linalg.solve(At @ A + 1e-9 * np.eye(4), At @ b)[..., 0]
+    return x[:, :3], np.clip(x[:, 3], 1e-3, 1e3)
 
-def solve_translation_scale(L1, L2, R):
-    """Linear 3Nx4 LS for (t, s) from m2 = s R m1 + t x (R d1). L*: (6, N).
-    Not used by solve_sim3 (which batches it) — kept for baselines/solvers.py."""
-    m1, d1, m2 = L1[:3], L1[3:], L2[:3]
-    N = L1.shape[1]
-    Rm1, Rd1 = R @ m1, R @ d1
-    A = np.zeros((3 * N, 4)); b = np.zeros(3 * N)
-    for i in range(N):
-        r = 3 * i
-        A[r:r + 3, :3] = -_skew(Rd1[:, i])
-        A[r:r + 3, 3] = Rm1[:, i]
-        b[r:r + 3] = m2[:, i]
-    x, _, _, _ = np.linalg.lstsq(A, b, rcond=None)
-    return x[:3], float(x[3])
+def _observable(d, T, skew_min):
+    """Keep line pairs that are not near-parallel: |d1 x d2| = sin(angle) > skew_min."""
+    return np.linalg.norm(np.cross(d[T[:, 0]], d[T[:, 1]]), axis=-1) > skew_min
 
-
-def transform_lines(L, R, t, s):
-    """Apply Sim(3): d' = R d,  m' = s R m + t x d'. L: (6, N)."""
-    d_out = R @ L[3:]
-    return np.vstack([s * (R @ L[:3]) + _skew(t) @ d_out, d_out])
-
-
-def _feet(d, m):
-    """Foot points d x m — invariant to the Plücker sign."""
-    return np.cross(d, m)
-
-
-# ── G(2,4) primitives: affine-Grassmann embedding + principal angle ─────────
-
-
-def _yz_np(p0, d):                                # (...,3),(...,3) -> (...,4,2)
-    one = np.ones_like(p0[..., :1]); zero = np.zeros_like(p0[..., :1])
-    c0 = np.concatenate([p0, one], -1)
-    c0 = c0 / (np.linalg.norm(c0, axis=-1, keepdims=True) + 1e-12)
-    c1 = np.concatenate([d, zero], -1)
-    c1 = c1 - c0 * (c1 * c0).sum(-1, keepdims=True)
-    c1 = c1 / (np.linalg.norm(c1, axis=-1, keepdims=True) + 1e-12)
-    return np.stack([c0, c1], -1)
-
-
-def _s2_np(M):                                    # cos(MAX principal angle)
-    F = (M ** 2).sum((-1, -2))
-    det = M[..., 0, 0] * M[..., 1, 1] - M[..., 0, 1] * M[..., 1, 0]
-    disc = np.sqrt(np.clip(F * F - 4 * det * det, 0.0, None))
-    return np.sqrt(np.clip((F - disc) * 0.5, 0.0, 1.0))
-
-
-# ── batched minimal-solve building blocks ───────────────────────────────────
-
-
-def _maxabs_sign(D):                              # hemisphere canon per line
-    j = np.abs(D).argmax(-1)
-    return np.sign(np.take_along_axis(D, j[..., None], -1))[..., 0]
-
-
-def _procrustes_batch(Dq, Dr):                    # (NS,L,3) dirs -> R (NS,3,3)
-    U, _, Vt = np.linalg.svd(np.einsum('nli,nlj->nij', Dr, Dq))
-    dt = np.linalg.det(U @ Vt)
-    Dg = np.zeros((len(U), 3, 3)); Dg[:, 0, 0] = Dg[:, 1, 1] = 1; Dg[:, 2, 2] = dt
-    return U @ Dg @ Vt
-
-
-def _solve_ts_batch(Mq, Dq, Mr, Rs):              # joint (t,s) per hypothesis
-    NS, L, _ = Mq.shape
-    Rd = np.einsum('nij,nlj->nli', Rs, Dq); Rm = np.einsum('nij,nlj->nli', Rs, Mq)
-    A = np.zeros((NS, 3 * L, 4)); b = np.zeros((NS, 3 * L))
-    for l in range(L):
-        r = 3 * l; rd = Rd[:, l]
-        A[:, r + 0, 1] = rd[:, 2]; A[:, r + 0, 2] = -rd[:, 1]
-        A[:, r + 1, 0] = -rd[:, 2]; A[:, r + 1, 2] = rd[:, 0]
-        A[:, r + 2, 0] = rd[:, 1]; A[:, r + 2, 1] = -rd[:, 0]
-        A[:, r:r + 3, 3] = Rm[:, l]; b[:, r:r + 3] = Mr[:, l]
-    AtA = np.einsum('nij,nik->njk', A, A) + 1e-9 * np.eye(4)
-    # NumPy 2 changed np.linalg.solve broadcasting: with a STACKED (n,4,4)
-    # matrix a (n,4) right-hand side is now read as one matrix, not a batch
-    # of vectors, and raises. Make the batch-of-vectors intent explicit.
-    rhs = np.einsum('nij,ni->nj', A, b)[..., None]
-    x = np.linalg.solve(AtA, rhs)[..., 0]
-    return x[:, :3], x[:, 3]
-
-
-# ── closed-form alternating descent on the Grassmann projection cost ────────
-# (SCALAR derivation note; sign-invariant; per-line weights w keep both blocks
-# closed-form, which is what would make this usable as a differentiable head)
-
-
-def _alternate(dq, fq, dr, fr, R, t, s, n_iter, w=None):
-    """dq,fq,dr,fr: (NS,L,3); R:(NS,3,3); t:(NS,3); s:(NS,). Returns updated
-    R,t,s and the per-sample projection cost (used as the consistency filter;
-    at n_iter=0 it is the cost of the init)."""
-    if w is None:
-        w = np.ones(dq.shape[:2])
-    eta = 1.0 / np.sqrt(1.0 + (fr ** 2).sum(-1))
-    y = eta[..., None] * fr
-    for _ in range(n_iter):
-        u = np.einsum('nij,nlj->nli', R, dq)
-        q = s[:, None, None] * np.einsum('nij,nlj->nli', R, fq) + t[:, None, :]
-        lam = (u * dr).sum(-1) / s[:, None]
-        qp = q - u * (u * q).sum(-1, keepdims=True)
-        yp = y - u * (u * y).sum(-1, keepdims=True)
-        gam = ((qp * yp).sum(-1) + eta) / ((qp ** 2).sum(-1) + 1.0)
-        alp = (u * (y - gam[..., None] * q)).sum(-1) / s[:, None]
-        x_dir = dq * lam[..., None]
-        x_aff = dq * alp[..., None] + gam[..., None] * fq
-        wg = w * gam
-        H = (wg * gam).sum(1)
-        Hs = np.where(H < 1e-12, 1.0, H)
-        mux = (wg[..., None] * x_aff).sum(1) / Hs[:, None]
-        muy = (wg[..., None] * y).sum(1) / Hs[:, None]
-        xa = x_aff - gam[..., None] * mux[:, None, :]
-        ya = y - gam[..., None] * muy[:, None, :]
-        M = np.einsum('nl,nli,nlj->nij', w, dr, x_dir) \
-            + np.einsum('nl,nli,nlj->nij', w, ya, xa)
-        U, S_, Vt = np.linalg.svd(M)
-        det = np.linalg.det(U @ Vt)
-        D = np.zeros_like(M); D[:, 0, 0] = D[:, 1, 1] = 1; D[:, 2, 2] = det
-        Rn = U @ D @ Vt
-        Sx = (w * (x_dir ** 2).sum(-1)).sum(1) + (w * (xa ** 2).sum(-1)).sum(1)
-        sn = np.clip((S_[:, 0] + S_[:, 1] + det * S_[:, 2]) /
-                     np.where(Sx < 1e-12, 1.0, Sx), 1e-3, 1e3)
-        tn = muy - sn[:, None] * np.einsum('nij,nj->ni', Rn, mux)
-        keep = ~((H < 1e-12) | (Sx < 1e-12) | ~np.isfinite(sn))
-        R = np.where(keep[:, None, None], Rn, R)
-        s = np.where(keep, sn, s)
-        t = np.where(keep[:, None], tn, t)
-    u = np.einsum('nij,nlj->nli', R, dq)
-    q = s[:, None, None] * np.einsum('nij,nlj->nli', R, fq) + t[:, None, :]
-    cdir = (1.0 - (u * dr).sum(-1) ** 2).sum(1)
-    qp = q - u * (u * q).sum(-1, keepdims=True)
-    yp = y - u * (u * y).sum(-1, keepdims=True)
-    gam = ((qp * yp).sum(-1) + eta) / ((qp ** 2).sum(-1) + 1.0)
-    caff = ((yp - gam[..., None] * qp) ** 2).sum((1, 2)) + ((eta - gam) ** 2).sum(1)
-    return R, t, s, cdir + caff
-
-
-# ── hypothesis scoring ──────────────────────────────────────────────────────
-
-
-def _score_g24(plq, plr, Rs, ts, ss, tau_rad, chunk=1024):
-    """Per-hypothesis G(2,4) inlier count over ALL candidate pairs: #(theta <
-    tau), theta = max principal angle between the affine-Grassmann embeddings.
-    The single hottest stage (~60-65% of solver runtime, measured), so it
-    thresholds cos(theta) against cos(tau) directly instead of taking arccos of
-    every hypothesis x pair, and uses matmul (batched BLAS) for the Gram."""
-    mq, dq, mr, dr = plq[:3], plq[3:], plr[:3], plr[3:]
-    Yr = _yz_np(np.cross(mr.T, dr.T), dr.T)
-    cos_tau = np.cos(tau_rad)
-    out = np.empty(len(Rs))
-    for lo in range(0, len(Rs), chunk):
-        Rc, tc, sc = Rs[lo:lo + chunk], ts[lo:lo + chunk], ss[lo:lo + chunk]
-        d_t = Rc @ dq                                   # (H,3,K)
-        m_t = sc[:, None, None] * (Rc @ mq) + np.cross(tc[:, :, None], d_t, axis=1)
-        Yq = _yz_np(np.transpose(np.cross(m_t, d_t, axis=1), (0, 2, 1)),
-                    np.transpose(d_t, (0, 2, 1)))
-        # Gram of the two 4x2 bases; matmul dispatches to batched BLAS, which
-        # is ~10x faster than the equivalent einsum and bit-identical.
-        out[lo:lo + chunk] = (_s2_np(np.matmul(np.swapaxes(Yq, -2, -1), Yr))
-                              > cos_tau).sum(1)
-    return out
-
-
-# ── optional GPU backend ────────────────────────────────────────────────────
-# `solve_sim3(..., device='cuda')` offloads the two heavy stages to torch.  The
-# cheap stages (top-k, sampling, skew gate, minimal solve) stay in numpy — ~9%
-# of runtime, and moving them would only add transfers.  torch is imported
-# lazily, so the CPU path keeps numpy as its only dependency.
-#
-# The two stages do NOT want the same device.  Measured per stage on an RTX
-# 5090 (fp32), hypotheses = 2 x nsamp:
-#
-#   stage            4k hyp (shipped)   16k     64k     256k
-#   G(2,4) scoring   48.4 -> 6.1 ms      -- biggest win at every size --
-#   alternation      22.4 -> 23.2 ms    2.11x   3.27x   3.87x
-#
-# Scoring is a dense batched matmul and wins everywhere (7.9x even at the
-# shipped size); the alternation is dominated by batched 3x3 SVD plus many
-# small kernels, so it only pays above ~8k hypotheses (= GPU_ALT_MIN).  Below
-# that it stays on the CPU even when device='cuda', so the flag is never a
-# pessimization.  End to end, same card:
-#
-#   nsamp     hyps     cpu ms   cuda fp32   cuda fp64
-#     2000     4000       71.1    52.5 1.35x  63.8 1.11x
-#     8000    16000      244.2   210.3 1.16x 263.5 0.93x
-#    32000    64000     1098.1   429.7 2.56x 923.1 1.19x
-#   128000   256000     4680.2  1279.9 3.66x 3764.4 1.24x
-#
-# So: the GPU is worth ~1.3-1.9x at the shipped nsamp and 2.5-3.7x if you raise
-# it.  (Caveat: measured while two trainings held the card at 100% — an idle
-# GPU will do better, and these ratios are noisy at the smaller sizes.)
-#
-# gpu_dtype: 'float32' (default) is the reason to use a GPU at all.  'float64'
-# reproduces the CPU path EXACTLY (rot diff 0, s diff 0 on every benchmark
-# pair) but only while the alternation is on the CPU — once it moves to the GPU
-# fp64 collapses to ~1.2x, because consumer cards run fp64 at 1/64 rate.
-#
-# fp32 is NOT bit-identical to the CPU path (different reduction orders): the
-# G(2,4) score is an integer count, so a hypothesis within fp noise of the tau
-# boundary can tip either way and change the argmax.  Judge a device the way
-# you judge any config change — multi-seed benchmark means, not per-pair
-# equality.  Measured fp32 vs CPU: 7-Scenes @5 20.2+/-1.7 vs 20.2+/-2.3,
-# matcher-free and mono_best identical to the decimal.
-
-GPU_ALT_MIN = 8000        # hypotheses below which the alternation stays on CPU
-
-
-def _torch():
-    import torch
-    return torch
-
-
-def _yz_t(p0, d):                                 # (...,3),(...,3) -> (...,4,2)
-    t = _torch()
-    one = t.ones_like(p0[..., :1])
-    c0 = t.cat([p0, one], -1)
-    c0 = c0 / (c0.norm(dim=-1, keepdim=True) + 1e-12)
-    c1 = t.cat([d, t.zeros_like(d[..., :1])], -1)
-    c1 = c1 - c0 * (c1 * c0).sum(-1, keepdim=True)
-    c1 = c1 / (c1.norm(dim=-1, keepdim=True) + 1e-12)
-    return t.stack([c0, c1], -1)
-
-
-def _s2_t(M):                                     # cos(MAX principal angle)
-    t = _torch()
-    F = (M ** 2).sum((-1, -2))
-    det = M[..., 0, 0] * M[..., 1, 1] - M[..., 0, 1] * M[..., 1, 0]
-    disc = t.sqrt(t.clamp(F * F - 4 * det * det, min=0.0))
-    return t.sqrt(t.clamp((F - disc) * 0.5, 0.0, 1.0))
-
-
-def _alternate_t(dq, fq, dr, fr, R, tr, s, n_iter):
-    """torch mirror of `_alternate` (unweighted; the CPU version's `w` hook is
-    for a differentiable head, which this backend does not serve)."""
-    t = _torch()
-    eta = 1.0 / t.sqrt(1.0 + (fr ** 2).sum(-1))
-    y = eta[..., None] * fr
-    for _ in range(n_iter):
-        u = t.einsum('nij,nlj->nli', R, dq)
-        q = s[:, None, None] * t.einsum('nij,nlj->nli', R, fq) + tr[:, None, :]
-        lam = (u * dr).sum(-1) / s[:, None]
-        qp = q - u * (u * q).sum(-1, keepdim=True)
-        yp = y - u * (u * y).sum(-1, keepdim=True)
-        gam = ((qp * yp).sum(-1) + eta) / ((qp ** 2).sum(-1) + 1.0)
-        alp = (u * (y - gam[..., None] * q)).sum(-1) / s[:, None]
-        x_dir = dq * lam[..., None]
-        x_aff = dq * alp[..., None] + gam[..., None] * fq
-        H = (gam * gam).sum(1)
-        Hs = t.where(H < 1e-12, t.ones_like(H), H)
-        mux = (gam[..., None] * x_aff).sum(1) / Hs[:, None]
-        muy = (gam[..., None] * y).sum(1) / Hs[:, None]
-        xa = x_aff - gam[..., None] * mux[:, None, :]
-        ya = y - gam[..., None] * muy[:, None, :]
-        M = t.einsum('nli,nlj->nij', dr, x_dir) + t.einsum('nli,nlj->nij', ya, xa)
-        U, S_, Vt = t.linalg.svd(M)
-        det = t.linalg.det(U @ Vt)
-        D = t.zeros_like(M); D[:, 0, 0] = D[:, 1, 1] = 1; D[:, 2, 2] = det
-        Rn = U @ D @ Vt
-        Sx = (x_dir ** 2).sum(-1).sum(1) + (xa ** 2).sum(-1).sum(1)
-        sn = t.clamp((S_[:, 0] + S_[:, 1] + det * S_[:, 2]) /
-                     t.where(Sx < 1e-12, t.ones_like(Sx), Sx), 1e-3, 1e3)
-        tn = muy - sn[:, None] * t.einsum('nij,nj->ni', Rn, mux)
-        keep = ~((H < 1e-12) | (Sx < 1e-12) | ~t.isfinite(sn))
-        R = t.where(keep[:, None, None], Rn, R)
-        s = t.where(keep, sn, s)
-        tr = t.where(keep[:, None], tn, tr)
-    u = t.einsum('nij,nlj->nli', R, dq)
-    q = s[:, None, None] * t.einsum('nij,nlj->nli', R, fq) + tr[:, None, :]
-    cdir = (1.0 - (u * dr).sum(-1) ** 2).sum(1)
-    qp = q - u * (u * q).sum(-1, keepdim=True)
-    yp = y - u * (u * y).sum(-1, keepdim=True)
-    gam = ((qp * yp).sum(-1) + eta) / ((qp ** 2).sum(-1) + 1.0)
-    caff = ((yp - gam[..., None] * qp) ** 2).sum((1, 2)) + ((eta - gam) ** 2).sum(1)
-    return R, tr, s, cdir + caff
-
-
-def _score_g24_t(plq, plr, Rs, ts, ss, tau_rad, chunk=4096):
-    """torch mirror of `_score_g24`; inputs/outputs are torch tensors."""
-    t = _torch()
-    mq, dq, mr, dr = plq[:3], plq[3:], plr[:3], plr[3:]
-    Yr = _yz_t(t.linalg.cross(mr.T, dr.T), dr.T)
-    cos_tau = float(np.cos(tau_rad))
-    out = t.empty(len(Rs), device=Rs.device, dtype=Rs.dtype)
-    for lo in range(0, len(Rs), chunk):
-        Rc, tc, sc = Rs[lo:lo + chunk], ts[lo:lo + chunk], ss[lo:lo + chunk]
-        d_t = Rc @ dq                                   # (H,3,K)
-        m_t = sc[:, None, None] * (Rc @ mq) \
-            + t.linalg.cross(tc[:, :, None].expand_as(d_t), d_t, dim=1)
-        Yq = _yz_t(t.linalg.cross(m_t, d_t, dim=1).transpose(1, 2),
-                   d_t.transpose(1, 2))
-        out[lo:lo + chunk] = (_s2_t(Yq.transpose(-2, -1) @ Yr)
-                              > cos_tau).sum(1).to(out.dtype)
-    return out
-
-
-# ── THE solver ──────────────────────────────────────────────────────────────
-
-
-
-def _refit_inliers(plq, plr, R, t, sc_, tau, iters=1):
-    """FINAL REFIT: one closed-form alternating step on ALL G(2,4) inliers of
-    the selected hypothesis (Ruey 2026-10-07).
-
-    SHIPPED 2026-10-07, and it CONTRADICTS this module's former "refinement of
-    any kind -- TESTED AND REJECTED" entry. That rejection was measured in the
-    v27 era on 7-Scenes and the old 810-pair cells with the graff matcher. On
-    the 500-scene ScanNet++ cell with v89 (ordinal_q) it is a large win, three
-    seeds, `tools/solver_lab.py` parity-verified bit-identical at refit=off:
-
-        topk   refit=off            refit=1 iter
-         200   286 rot<5 / 226 str  308 / 247
-         400   305 / 237            325 / 261     <- SHIPPED (interior optimum
-         600   314 / 251            329 / 263        on cost: 400->1000 adds
-        1000   307 / 254            331 / 266        only +6/+5 for 2.2x time)
-
-    ONE iteration is enough: 2 and 3 give 312/246 and 315/246 -- rot<5 creeps
-    but strict does not, and the median is flat at 3.44 from iteration 1.
-    A score-weighted variant was a wash (311/247).
-    The refit is REJECTED unless it does not lower the G(2,4) count, so it can
-    never trade consensus for a prettier residual.
-    It does NOTHING on KITTI submaps (6/10 at 6.87 deg either way) -- that cell
-    is matcher-starved (median 3 correct matches in the top-200), not
-    pose-limited.
-    """
-    dq_a, mq_a = plq[3:].T, plq[:3].T
-    dr_a, mr_a = plr[3:].T, plr[:3].T
-    fq_a, fr_a = _feet(dq_a, mq_a), _feet(dr_a, mr_a)
-    u = dq_a @ R.T
-    Yq = _yz_np(sc_ * (fq_a @ R.T) + t, u)
-    Yr = _yz_np(fr_a, dr_a)
-    inl = _s2_np(np.matmul(np.swapaxes(Yq, -2, -1), Yr)) > np.cos(tau)
-    if inl.sum() < 3:
+def _alternation_step(dq, fq, dr, fr, R, t, s, sx_max=np.inf):
+    """One step of closed-form alternating descent on the Grassmann projection cost"""
+    eta = 1.0 / np.sqrt(1.0 + (fr * fr).sum(-1))
+    y = eta[:, None] * fr                                  # reference [f; 1]/n, spatial part
+    u = dq @ R.T                                           # transformed query direction
+    q = s * fq @ R.T + t                                   # transformed query foot
+    perp = lambda a: a - u * (u * a).sum(-1, keepdims=True)
+    # block 1: latents
+    lam = (u * dr).sum(-1) / s
+    gam = ((perp(q) * perp(y)).sum(-1) + eta) / ((perp(q) ** 2).sum(-1) + 1.0)
+    alp = (u * (y - gam[:, None] * q)).sum(-1) / s
+    x_dir = dq * lam[:, None]
+    x_aff = dq * alp[:, None] + gam[:, None] * fq
+    # block 2: similarity Procrustes, with the affine points centred under weights gam
+    H = (gam * gam).sum()
+    if H < 1e-12:
         return None
-    Rr, tr, sr, cr = _alternate(dq_a[inl][None], fq_a[inl][None],
-                                dr_a[inl][None], fr_a[inl][None],
-                                R[None], t[None], np.array([sc_]), iters)
-    return None if not np.isfinite(cr[0]) else (Rr, tr, sr)
+    mux = (gam[:, None] * x_aff).sum(0) / H
+    muy = (gam[:, None] * y).sum(0) / H
+    xa = x_aff - gam[:, None] * mux
+    ya = y - gam[:, None] * muy
+    U, S, Vt = np.linalg.svd(dr.T @ x_dir + ya.T @ xa)
+    det = np.linalg.det(U @ Vt)
+    Rn = U @ np.diag([1.0, 1.0, det]) @ Vt
+    Sx = (x_dir ** 2).sum() + (xa ** 2).sum()
+    if Sx / len(dq) > sx_max:     # degenerate: Sx grows like 1/s^2 as the scale collapses
+        return None
+    sn = np.clip((S[0] + S[1] + det * S[2]) / Sx, 1e-3, 1e3)
+    tn = muy - sn * Rn @ mux
+    if not (np.isfinite(Rn).all() and np.isfinite(tn).all() and np.isfinite(sn)):
+        return None
+    return Rn, tn, sn
 
+def _best_hypothesis(R, t, s, dq, fq, Yr, thr, chunk=256, block=50):
+    """Index of the hypothesis with the most inliers (overlap > thr); the first on ties. """
+    K = len(Yr)
+    best_n, best_i = -1, 0
+    for lo in range(0, len(R), chunk):
+        idx = np.arange(lo, min(lo + chunk, len(R)))
+        n = np.zeros(len(idx), int)
+        for k in range(0, K, block):
+            ks = slice(k, k + block)
+            n += (_overlap(R[idx], t[idx], s[idx], dq[ks], fq[ks], Yr[ks]) > thr).sum(1)
+            alive = n + max(K - k - block, 0) > best_n
+            idx, n = idx[alive], n[alive]
+            if len(idx) == 0:
+                break
+        if len(idx) and n.max() > best_n:
+            best_n, best_i = n.max(), idx[n.argmax()]
+    return best_i
 
-def solve_sim3(solver, prob, topk=400, nsamp=8000, tau_deg=9.0,
-               skew_min=0.3, cost_max=0.12, alt_iters=3, seed=0,
-               refit_iters=1, device='cpu', gpu_dtype='float32'):
-    """THE Sim(3) estimate from a matcher probability matrix — the module
-    docstring carries the pipeline, the frozen defaults and the rejected
-    variants.  Defaults = INDOOR profile; OUTDOOR = `SOLVE_SIM3_OUTDOOR`.
-    Returns (R, t, s) with t in the caller's original metric frame.
+def _refit(dq, fq, dr, fr, Yr, R, t, s, thr, iters, sx_max):
+    """Re-solve the winning pose on ALL its inliers with `iters` alternating steps."""
+    inl = _overlap(R[None], t[None], np.array([s]), dq, fq, Yr)[0] > thr
 
-    `device='cuda'` offloads the G(2,4) scoring (and, above GPU_ALT_MIN
-    hypotheses, the alternation) to torch: ~1.3-1.9x at the shipped nsamp,
-    ~3.7x at nsamp 128000.  Results are statistically equivalent, NOT
-    bit-identical (`gpu_dtype='float64'` is exact) — see the GPU backend
-    section above."""
-    nq = prob.shape[1]; k = min(topk, prob.size)
-    flat = np.argpartition(prob.ravel(), -k)[-k:]
-    ir, iq = flat // nq, flat % nq
-    plq = solver.p_q[iq].T.astype(float); plr = solver.p_r[ir].T.astype(float)
-    K = plq.shape[1]
-    rng = np.random.default_rng(seed)
-    T = rng.integers(0, K, (nsamp, 2))
+    for _ in range(iters):
+        step = _alternation_step(dq[inl], fq[inl], dr[inl], fr[inl], R, t, s, sx_max)
+        if step is None:
+            break
+        R, t, s = step
+    return R, t, float(s)
+
+def solve_sim3(p_q, p_r, prob, topk=300, nsamp=3000, proj_thresh=1.984,
+               skew_min=0.3, seed=0, refit_iters=2, sx_max=1e3):
+    """Sim(3) estimate (R, t, s) from a matcher probability matrix, in the caller's frame."""
+    # candidate correspondences = the top-k scores, sorted by index
+    k = min(topk, prob.size)
+    flat = np.sort(np.argpartition(prob.ravel(), -k)[-k:])
+    ir, iq = np.divmod(flat, prob.shape[1])
+    Lq, Lr = p_q[iq].astype(float), p_r[ir].astype(float)
+    dq, fq = _dir_foot(Lq)
+    dr, fr = _dir_foot(Lr)
+    mq, mr = Lq[:, :3], Lr[:, :3]
+
+    # random 2-line samples, near-parallel pairs dropped on both sides
+    T = np.random.default_rng(seed).integers(0, k, (nsamp, 2))
     T = T[T[:, 0] != T[:, 1]]
-    if skew_min > 0:                # scale-free observability gate, PRE-solve
-        ok = np.ones(len(T), bool)
-        for pl in (plq, plr):
-            f_all = _feet(pl[3:].T, pl[:3].T)
-            thr = skew_min * (float(np.median(
-                np.linalg.norm(f_all, axis=1))) + 1e-9)
-            a, b = pl[3:, T[:, 0]].T, pl[3:, T[:, 1]].T
-            ok &= np.abs((np.cross(a, b)
-                          * (f_all[T[:, 1]] - f_all[T[:, 0]])).sum(1)) > thr
-        T = T[ok]
+    if skew_min > 0:
+        T = T[_observable(dq, T, skew_min) & _observable(dr, T, skew_min)]
     if len(T) == 0:
         return np.eye(3), np.zeros(3), 1.0
-    dq = np.stack([plq[3:, T[:, l]].T for l in range(2)], 1)
-    dr = np.stack([plr[3:, T[:, l]].T for l in range(2)], 1)
-    mq = np.stack([plq[:3, T[:, l]].T for l in range(2)], 1)
-    mr = np.stack([plr[:3, T[:, l]].T for l in range(2)], 1)
-    fq, fr = _feet(dq, mq), _feet(dr, mr)
 
-    # SIGN: canonicalize query line 1, propose BOTH signs of line 2 and let
-    # G(2,4) arbitrate.  Both proposals are solved as ONE batch of 2*NS
-    # samples.  The canon feeds ONLY the init — `_alternate` gets the raw
-    # quantities (it is sign-invariant, and the feet f = d x m already are).
-    s1 = _maxabs_sign(dq[:, :1])[:, 0]
-    sq = np.concatenate([np.stack([s1, s1], 1), np.stack([s1, -s1], 1)])
-    dq2, mq2, fq2 = (np.concatenate([a, a]) for a in (dq, mq, fq))
-    dr2, mr2, fr2 = (np.concatenate([a, a]) for a in (dr, mr, fr))
-    sgr = _maxabs_sign(dr2)[..., None]
-    dqc, mqc = dq2 * sq[..., None], mq2 * sq[..., None]
-    Rs = _procrustes_batch(dqc, dr2 * sgr)
-    ts, ss = _solve_ts_batch(mqc, dqc, mr2 * sgr, Rs)
-    ss = np.clip(np.abs(ss), 1e-3, 1e3)
-
-    if device == 'cpu':
-        Rs, ts, ss, cost = _alternate(dq2, fq2, dr2, fr2, Rs, ts, ss, alt_iters)
-        keep = np.isfinite(cost)                     # consistency filter
-        if cost_max > 0:
-            keep &= cost < cost_max
-        Rs, ts, ss = Rs[keep], ts[keep], ss[keep]
-        if len(Rs) == 0:
-            return np.eye(3), np.zeros(3), 1.0
-        tau = np.deg2rad(tau_deg)
-        sc = _score_g24(plq, plr, Rs, ts, ss, tau)
-        bi = int(np.argmax(sc))
-        Rb, tb, sb = Rs[bi], np.asarray(ts[bi]), float(ss[bi])
-        if refit_iters > 0:
-            out = _refit_inliers(plq, plr, Rb, tb, sb, tau, refit_iters)
-            if out is not None:
-                Rr, tr, sr = out
-                if _score_g24(plq, plr, Rr, tr, sr, tau)[0] >= sc[bi]:
-                    Rb, tb, sb = Rr[0], np.asarray(tr[0]), float(sr[0])
-        return Rb, tb / solver.alpha, float(sb)
-
-    torch = _torch()                                 # GPU backend
-    dt = getattr(torch, gpu_dtype)
-
-    def to(a):
-        return torch.as_tensor(np.ascontiguousarray(a), device=device, dtype=dt)
-
-    if len(dq2) >= GPU_ALT_MIN:                      # big batch: alternate on GPU
-        Rs, ts, ss, cost = _alternate_t(to(dq2), to(fq2), to(dr2), to(fr2),
-                                        to(Rs), to(ts), to(ss), alt_iters)
-        keep = torch.isfinite(cost)
-        if cost_max > 0:
-            keep &= cost < cost_max
-        Rs, ts, ss = Rs[keep], ts[keep], ss[keep]
-    else:                                            # small batch: CPU is faster
-        Rs, ts, ss, cost = _alternate(dq2, fq2, dr2, fr2, Rs, ts, ss, alt_iters)
-        keep = np.isfinite(cost)
-        if cost_max > 0:
-            keep &= cost < cost_max
-        Rs, ts, ss = to(Rs[keep]), to(ts[keep]), to(ss[keep])
-    if len(Rs) == 0:
+    # two rotation hypotheses per sample, then (t, s) for each
+    R0 = _procrustes(dq[T], dr[T])
+    a = dr[T[:, 0]]
+    R = np.concatenate([R0, (2 * a[:, :, None] * a[:, None, :] - np.eye(3)) @ R0])
+    TT = np.concatenate([T, T])
+    t, s = _solve_ts(dq[TT], mq[TT], dr[TT], mr[TT], R)
+    ok = np.isfinite(t).all(1) & np.isfinite(s)
+    R, t, s = R[ok], t[ok], s[ok]
+    if len(R) == 0:
         return np.eye(3), np.zeros(3), 1.0
-    tau = np.deg2rad(tau_deg)
-    sc = _score_g24_t(to(plq), to(plr), Rs, ts, ss, tau)
-    bi = int(torch.argmax(sc))
-    R = Rs[bi].double().cpu().numpy()
-    U, _, Vt = np.linalg.svd(R)          # fp32 drifts off SO(3) by ~1e-6;
-    D = np.diag([1.0, 1.0, np.linalg.det(U @ Vt)])   # re-project so callers
-    Rb = U @ D @ Vt                      # can rely on R being orthonormal
-    tb = ts[bi].double().cpu().numpy()   # still in alpha units
-    sb = float(ss[bi])
-    # FINAL REFIT, mirrored from the CPU path (added 2026-10-07). Without this
-    # the GPU backend silently returned a DIFFERENT METHOD: ~26 fewer succ on
-    # the 810-pair cell, so any GPU-produced number or timing was not
-    # comparable to the CPU default. The refit itself runs in numpy -- it
-    # touches one hypothesis, not nsamp of them, so there is nothing to gain
-    # from the GPU, and sharing the CPU implementation keeps the two backends
-    # from drifting apart again. The accept/reject comparison uses the numpy
-    # scorer on BOTH sides so the guard is self-consistent.
-    if refit_iters > 0:
-        sc_before = _score_g24(plq, plr, Rb[None], tb[None], np.array([sb]), tau)[0]
-        out = _refit_inliers(plq, plr, Rb, tb, sb, tau, refit_iters)
-        if out is not None:
-            Rr, tr, sr = out
-            if _score_g24(plq, plr, Rr, tr, sr, tau)[0] >= sc_before:
-                Rb, tb, sb = Rr[0], np.asarray(tr[0]), float(sr[0])
-    return Rb, tb / solver.alpha, float(sb)
 
-
-# Outdoor/high-noise profile (KITTI mono_best-validated):
-SOLVE_SIM3_OUTDOOR = dict(tau_deg=3.0, skew_min=0.05, nsamp=4000)
+    #  most G(2,4) inliers wins;  5. refit it on its inliers
+    Yr = _basis(dr, fr)
+    b = _best_hypothesis(R, t, s, dq, fq, Yr, proj_thresh)
+    return _refit(dq, fq, dr, fr, Yr, R[b], t[b], float(s[b]), proj_thresh, refit_iters, sx_max)
