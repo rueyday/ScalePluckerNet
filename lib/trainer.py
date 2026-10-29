@@ -1,399 +1,178 @@
+"""Training loop for PluckerNetKnn.
+
+One optimizer step = iter_size SAMPLES (a bucketed batch carries B of them), summed loss, grad-norm clip 1.0, Adam,
+cosine LR from lr to 1e-6 over the run.  Validation reports the share of GT correspondences among the top-100 entries
+of the plan (avg_inlier_ratio), which picks best_val_checkpoint.  It is a training monitor only: rank checkpoints by
+registration on the real benchmarks, never by this number.
 """
-Extends the original PlueckerNet trainer to Sim(3):
-"""
-import os
-import os.path as osp
-import logging
+import hashlib
 import json
-import gc
+import logging
+import os
+import time
 
 import numpy as np
 import torch
-import torch.optim as optim
-from tensorboardX import SummaryWriter
 
-from lib.utils import load_model, ensure_dir, AverageMeter, Timer
-from lib.loss import TotalLoss
+from lib.loss import total_loss
+from lib.model import HEADS, LAYERS, WIDTH, PluckerNetKnn
 
-class _DualWriter:
-    """SummaryWriter that also mirrors scalars to Weights & Biases.
 
-    Opt-in via WANDB=1. Every existing self.writer.add_scalar(...) call is
-    forwarded unchanged to TensorBoard, so a run WITHOUT WANDB behaves exactly
-    as before; wandb is a pure add-on. Requires `wandb login` (or WANDB_API_KEY)
-    — scalars are uploaded to wandb.ai.
-    """
+class _Writer:
+    """TensorBoard, mirrored to Weights & Biases when WANDB=1 (needs `wandb login`).
 
-    def __init__(self, sw, wb=None):
-        self._sw, self._wb = sw, wb
-        self.spe = None          # iterations per epoch; set by the trainer
+    TensorBoard keeps a step series per tag; wandb has ONE global counter and rejects negative steps, while train/*
+    is logged per ITERATION (epoch 0 starts at -steps) and val/* per EPOCH.  So wandb gets both on an `epoch` axis.
+    The wandb run id is md5(run name), so restarts and tools/wandb_backfill.py update the same run."""
 
-    def add_scalar(self, tag, value, global_step=None, *a, **k):
-        self._sw.add_scalar(tag, value, global_step, *a, **k)
-        if self._wb is None:
+    def __init__(self, logdir, config):
+        from tensorboardX import SummaryWriter
+        self.tb, self.wb, self.steps_per_epoch = SummaryWriter(logdir=logdir), None, None
+        if os.environ.get('WANDB', '0') != '1':
             return
         try:
-            # TensorBoard keeps a separate step series per tag; wandb has ONE
-            # global counter. train/* is logged per ITERATION and val/* per
-            # EPOCH, so forwarding global_step raw would stack every val point
-            # at the far left -- and epoch 0 logs at -n_steps, which wandb
-            # rejects outright. Put both on a shared `epoch` axis instead.
-            row = {tag: float(value)}
-            if global_step is not None:
-                if tag.startswith('train/') and self.spe:
-                    row['epoch'] = global_step / float(self.spe) + 1.0
-                elif not tag.startswith('train/'):
-                    row['epoch'] = float(global_step)
-            self._wb.log(row)
-        except Exception:
-            pass
-
-    def __getattr__(self, name):
-        return getattr(self._sw, name)
-
-
-class Sim3Trainer:
-
-    def __init__(self, config, data_loader, val_data_loader=None):
-
-        Model = load_model('PluckerNetKnn')
-        self.model = Model(config)
-
-        logging.info(self.model)
-
-        self.config          = config
-        self.max_epoch       = config.train_epoches
-        self.save_freq       = config.train_save_freq_epoch
-        self.val_max_iter    = config.val_max_iter
-        self.val_epoch_freq  = config.val_epoch_freq
-        self.best_val_metric = config.best_val_metric
-        self.best_val_epoch  = -np.inf
-        self.best_val        = -np.inf
-        self.curriculum_ir   = 0.0   # current val avg_inlier_ratio driving curriculum
-
-        if config.use_gpu and not torch.cuda.is_available():
-            raise ValueError('GPU not available but cuda flag set')
-
-        if config.gpu_inds > -1:
-            torch.cuda.set_device(config.gpu_inds)
-            self.device = torch.device('cuda', config.gpu_inds)
-        else:
-            self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-        self.optimizer = getattr(optim, config.optimizer)(
-            self.model.parameters(), lr=config.train_lr, betas=(0.9, 0.999)
-        )
-        self.scheduler    = optim.lr_scheduler.ExponentialLR(self.optimizer, config.exp_gamma)
-        self.start_epoch  = config.train_start_epoch
-        self.checkpoint_dir = os.path.join(config.out_dir, config.dataset, config.model_nb)
-
-        ensure_dir(self.checkpoint_dir)
-        json.dump(config, open(os.path.join(self.checkpoint_dir, 'config.json'), 'w'),
-                  indent=4, sort_keys=False)
-
-        self.iter_size  = config.iter_size
-        self.batch_size = data_loader.batch_size
-        self.data_loader     = data_loader
-        self.val_data_loader = val_data_loader
-        self.test_valid      = val_data_loader is not None
-
-        self.model = self.model.to(self.device)
-        # Compiled handle used for forward passes only (~1.5x on this
-        # launch-overhead-bound model). Checkpoints are always saved from
-        # self.model so state_dict keys stay free of the _orig_mod. prefix.
-        try:
-            self.net = torch.compile(self.model, dynamic=True)
+            import wandb
+            name = os.path.basename(logdir.rstrip('/'))
+            wandb.init(project=os.environ.get('WANDB_PROJECT', 'scalepluckernet'), name=name,
+                       id=hashlib.md5(name.encode()).hexdigest()[:8], config=config, resume='allow')
+            for k in ('epoch', 'train/*', 'val/*'):
+                wandb.define_metric(k, **({} if k == 'epoch' else {'step_metric': 'epoch'}))
+            self.wb = wandb
         except Exception as e:
-            logging.warning(f'torch.compile unavailable, running eager: {e}')
-            self.net = self.model
-        _wb = None
-        if os.environ.get('WANDB', '0') == '1':
+            logging.warning(f'wandb disabled ({type(e).__name__}: {e})')
+
+    def add_scalar(self, tag, value, step):
+        self.tb.add_scalar(tag, value, step)
+        if self.wb is not None:
+            ep = step / self.steps_per_epoch + 1.0 if tag.startswith('train/') else float(step)
             try:
-                import wandb as _wandb
-                # DETERMINISTIC id: without one, resume='allow' has nothing to
-                # resume and every restart creates a NEW run. The GPU drives a
-                # display, so the CUDA watchdog kills runs regularly and the
-                # supervisor restarts them -- v65 fragmented into two runs
-                # before this was fixed. md5(name) keeps all restarts on ONE
-                # wandb run, matching tools/wandb_backfill.py.
-                _rn = osp.basename(str(self.checkpoint_dir).rstrip('/'))
-                _wandb.init(project=os.environ.get('WANDB_PROJECT', 'scalepluckernet'),
-                            name=_rn,
-                            id=__import__('hashlib').md5(_rn.encode()).hexdigest()[:8],
-                            config=dict(config), resume='allow')
-                _wandb.define_metric('epoch')
-                _wandb.define_metric('train/*', step_metric='epoch')
-                _wandb.define_metric('val/*', step_metric='epoch')
-                _wb = _wandb
-                logging.info('wandb: streaming to project '
-                             + os.environ.get('WANDB_PROJECT', 'scalepluckernet'))
-            except Exception as e:
-                logging.warning('wandb disabled (%s: %s)' % (type(e).__name__, e))
-        self.writer = _DualWriter(SummaryWriter(logdir=self.checkpoint_dir), _wb)
+                self.wb.log({tag: float(value), 'epoch': ep})
+            except Exception:
+                pass
 
-        if config.resume is not None:
-            if osp.isfile(config.resume):
-                logging.info(f"=> loading checkpoint '{config.resume}'")
-                state = torch.load(config.resume, weights_only=False)
-                self.start_epoch = state['epoch']
-                self.model.load_state_dict(state['state_dict'])
-                self.scheduler.load_state_dict(state['scheduler'])
-                self.optimizer.load_state_dict(state['optimizer'])
-                if 'best_val' in state:
-                    self.best_val       = state['best_val']
-                    self.best_val_epoch = state['best_val_epoch']
-                    self.best_val_metric = state['best_val_metric']
-            else:
-                raise ValueError(f"No checkpoint found at '{config.resume}'")
-    
+
+class Trainer:
+    def __init__(self, args, train_loader, val_loader, epoch_size):
+        self.args, self.train_loader, self.val_loader, self.epoch_size = args, train_loader, val_loader, epoch_size
+        self.device = torch.device('cuda', args.gpu)
+        torch.cuda.set_device(self.device)
+        self.model = PluckerNetKnn().to(self.device)
+        # compiled handle for forward passes (~1.5x on this launch-overhead-bound model); checkpoints are saved from
+        # self.model so their keys carry no _orig_mod. prefix
+        self.net = torch.compile(self.model, dynamic=True)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr)
+        # T_0 = epochs + 1: epochs 0..epochs are trained (inclusive), and WarmRestarts would restart the LR at T_0
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            self.optimizer, T_0=args.epochs + 1, T_mult=1, eta_min=1e-6)
+        self.start_epoch, self.best_val, self.best_val_epoch = 0, -np.inf, -1
+        # the architecture keys let load_matcher refuse a checkpoint of any other architecture
+        self.config = dict(vars(args), encoder='ordinal_q', net_nchannel=WIDTH, GNN_layers=LAYERS, attn_heads=HEADS)
+        self.dir = os.path.join(args.out_dir, args.dataset, args.name)
+        os.makedirs(self.dir, exist_ok=True)
+        with open(os.path.join(self.dir, 'config.json'), 'w') as f:
+            json.dump(self.config, f, indent=4)
+        if args.resume:
+            s = torch.load(args.resume, weights_only=False, map_location='cpu')
+            self.model.load_state_dict(s['state_dict'])
+            self.optimizer.load_state_dict(s['optimizer'])
+            self.scheduler.load_state_dict(s['scheduler'])
+            # s['epoch'] FINISHED before it was saved: resume at the next one (v104 re-trained epoch 2 five times)
+            self.start_epoch = s['epoch'] + 1
+            self.best_val, self.best_val_epoch = s.get('best_val', -np.inf), s.get('best_val_epoch', -1)
+            logging.info(f'resumed {args.resume} at epoch {self.start_epoch}')
+        elif args.init_from:
+            self.model.load_state_dict(torch.load(args.init_from, weights_only=False, map_location='cpu')['state_dict'])
+            logging.info(f'weights from {args.init_from} (fresh optimizer and schedule)')
+        self.writer = _Writer(self.dir, self.config)
+
     def train(self):
-        if self.test_valid:
-            with torch.no_grad():
-                val_dict = self._valid_epoch()
-            # Log the start-of-training validation AT THE EPOCH TRAINING STARTS
-            # FROM, not a hardcoded 0. On a fresh run start_epoch is 0, so nothing
-            # changes; on a RESUME the old code planted the current val at epoch 0
-            # -- on v74_simple W&B holds such points at steps 31869 and 32941 --
-            # and any chart with an `epoch` x-axis drew its line back to the left
-            # edge every time the run was resumed.
-            for k, v in val_dict.items():
-                if np.isfinite(v):
-                    self.writer.add_scalar(f'val/{k}', v, self.start_epoch)
-
-        for epoch in range(self.start_epoch, self.max_epoch + 1):
-            lr = self.scheduler.get_last_lr()
-            logging.info(f' Epoch: {epoch}, LR: {lr}')
-            self._train_epoch(epoch)
-            self._save_checkpoint(epoch)
+        v = self.validate()
+        self.writer.add_scalar('val/avg_inlier_ratio', v, self.start_epoch)
+        for epoch in range(self.start_epoch, self.args.epochs + 1):
+            logging.info(f'Epoch {epoch}, LR {self.scheduler.get_last_lr()}')
+            self.train_epoch(epoch)
+            self.save(epoch, 'checkpoint')
             self.scheduler.step()
+            if epoch % self.args.val_epoch_freq:
+                continue
+            v = self.validate()
+            self.writer.add_scalar('val/avg_inlier_ratio', v, epoch)
+            if v > self.best_val:
+                self.best_val, self.best_val_epoch = v, epoch
+                self.save(epoch, 'best_val_checkpoint')
+            logging.info(f'best avg_inlier_ratio {self.best_val:.3f} at epoch {self.best_val_epoch}')
 
-            if self.test_valid and epoch % self.val_epoch_freq == 0:
-                with torch.no_grad():
-                    val_dict = self._valid_epoch()
-                self.curriculum_ir = val_dict.get('avg_inlier_ratio', 0.0)
-                for k, v in val_dict.items():
-                    if np.isfinite(v):
-                        self.writer.add_scalar(f'val/{k}', v, epoch)
-                if self.best_val < val_dict[self.best_val_metric]:
-                    logging.info(
-                        f'Saving best val model — '
-                        f'{self.best_val_metric}: {val_dict[self.best_val_metric]:.3f}'
-                    )
-                    self.best_val       = val_dict[self.best_val_metric]
-                    self.best_val_epoch = epoch
-                    self._save_checkpoint(epoch, 'best_val_checkpoint')
-                else:
-                    logging.info(
-                        f'Current best {self.best_val_metric}: '
-                        f'{self.best_val:.3f} at epoch {self.best_val_epoch}'
-                    )
+    def save(self, epoch, name):
+        torch.save(dict(epoch=epoch, state_dict=self.model.state_dict(), optimizer=self.optimizer.state_dict(),
+                        scheduler=self.scheduler.state_dict(), config=self.config, best_val=self.best_val,
+                        best_val_epoch=self.best_val_epoch, best_val_metric='avg_inlier_ratio'),
+                   os.path.join(self.dir, f'{name}.pth'))
 
-    def _save_checkpoint(self, epoch, filename='checkpoint'):
-        state = {
-            'epoch':           epoch,
-            'state_dict':      self.model.state_dict(),
-            'optimizer':       self.optimizer.state_dict(),
-            'scheduler':       self.scheduler.state_dict(),
-            'config':          self.config,
-            'best_val':        self.best_val,
-            'best_val_epoch':  self.best_val_epoch,
-            'best_val_metric': self.best_val_metric,
-        }
-        path = os.path.join(self.checkpoint_dir, f'{filename}.pth')
-        logging.info(f'Saving checkpoint: {path}')
-        torch.save(state, path)
-
-    def _train_epoch(self, epoch):
-        gc.collect()
-        ds = self.data_loader.dataset
-        if hasattr(ds, 'set_curriculum_phase'):
-            ds.set_curriculum_phase(self.curriculum_ir / 100.0)
+    def train_epoch(self, epoch):
         self.model.train()
-        total_loss, total_num = 0.0, 0.0
-
-        bs = getattr(self.data_loader, 'batch_sampler', None)
-        if hasattr(bs, 'start_epoch'):
-            bs.start_epoch(epoch)       # live buffer swap BEFORE workers fork
-        data_loader_iter = iter(self.data_loader)
-        iter_size  = self.iter_size
-        start_iter = (epoch - 1) * max(1, (getattr(self.data_loader, 'epoch_samples', None)
-                                           or len(self.data_loader)) // iter_size)
-        data_meter, data_timer, total_timer = AverageMeter(), Timer(), Timer()
-        loss_fn = TotalLoss(
-            getattr(self.config, 'match_w', 0.0),
-            getattr(self.config, 'dustbin_w', 0.0) if getattr(self.config, 'dustbin', False) else 0.0
-        ).to(self.device)
-
-        # iter_size counts SAMPLES per optimizer step (not loader batches):
-        # with a bucketed loader a batch carries B samples, so we accumulate
-        # until >= iter_size samples. B == 1 reproduces the old loop exactly
-        # (per-sample loss summed, i.e. sum-reduction over the step).
-        n_samples_epoch = getattr(self.data_loader, 'epoch_samples', None) \
-            or len(self.data_loader)
-        n_steps = max(1, n_samples_epoch // iter_size)
-        self.writer.spe = n_steps
-        for curr_iter in range(n_steps):
+        self.train_loader.batch_sampler.start_epoch(epoch)         # live buffer swap BEFORE the workers fork
+        it = iter(self.train_loader)
+        n_steps = max(1, self.epoch_size // self.args.iter_size)
+        self.writer.steps_per_epoch = n_steps
+        t_data = t_all = 0.0
+        for step in range(n_steps):
+            t0 = time.perf_counter()
             self.optimizer.zero_grad()
-            # accumulate logging stats on-device; sync once per iteration
-            batch_total_loss = torch.zeros((), device=self.device)
-            batch_prob_loss  = torch.zeros((), device=self.device)
-            data_time = 0.0
-            total_timer.tic()
-
-            acc = 0
-            exhausted = False
-            while acc < iter_size:
-                data_timer.tic()
+            loss_sum = torch.zeros((), device=self.device)
+            prob_sum = torch.zeros((), device=self.device)
+            n = 0
+            while n < self.args.iter_size:
+                t1 = time.perf_counter()
                 try:
-                    matches, plucker1, plucker2, *_ = next(data_loader_iter)
+                    C, p1, p2 = next(it)
                 except StopIteration:
-                    # Bucketed batches carry up to iter_size samples each, so
-                    # a step overshoots by up to B-1 and the epoch's buffer
-                    # runs out ~15% early. Previously the loop re-created the
-                    # iterator here, which in live mode REGENERATED (blocking
-                    # on the prefetch, then eating part of the next buffer)
-                    # and, with loader workers, forked them against a stale
-                    # buffer (the v83 OOM). An epoch is one buffer: finish the
-                    # step with what we have and end the epoch.
-                    exhausted = True
-                    data_timer.toc(average=False)
+                    # a bucketed batch overshoots iter_size by up to B-1 samples, so the buffer runs out ~15% early:
+                    # an epoch is one buffer, finish the step with what there is
                     break
-                data_time += data_timer.toc(average=False)
-
-                matches  = matches.to(self.device, non_blocking=True)
-                plucker1 = plucker1.to(self.device, non_blocking=True)
-                plucker2 = plucker2.to(self.device, non_blocking=True)
-                B = matches.shape[0]
-
-                prob_matrix, prior1, prior2 = self.net(plucker1, plucker2)
-
-                # x B: keep sum-over-samples semantics at any batch size
-                loss = loss_fn(prob_matrix, matches, prior1, prior2) * B
-
-                if not torch.isnan(loss).any():
+                t_data += time.perf_counter() - t1
+                C, p1, p2 = (x.to(self.device, non_blocking=True) for x in (C, p1, p2))
+                B = C.shape[0]
+                P, r, c = self.net(p1, p2)
+                loss = total_loss(P, C, r, c, self.args.match_w) * B        # x B: sum over samples at any B
+                if not torch.isnan(loss):
                     loss.backward()
-
-                batch_total_loss += loss.detach().sum()
-                batch_prob_loss  += (
-                    (1.0 - 2.0 * matches) * prob_matrix.detach()
-                ).sum(dim=(-2, -1)).mean() * B
-                acc += B
-
-            if acc == 0:            # buffer ended exactly on a step boundary
-                logging.info(f'Train Epoch: {epoch} buffer exhausted after '
-                             f'{curr_iter} steps ({n_steps} nominal)')
-                break
+                loss_sum += loss.detach()
+                prob_sum += ((1.0 - 2.0 * C) * P.detach()).sum(dim=(-2, -1)).mean() * B
+                n += B
+            if n == 0:
+                logging.info(f'epoch {epoch}: buffer exhausted after {step} of {n_steps} steps')
+                return
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
+            t_all += time.perf_counter() - t0
+            if step % 10 == 0:
+                gstep = (epoch - 1) * n_steps + step
+                self.writer.add_scalar('train/total_loss', loss_sum.item(), gstep)
+                self.writer.add_scalar('train/prob_loss', prob_sum.item(), gstep)
+                k = 1 if step == 0 else 10
+                logging.info(f'epoch {epoch} [{step}/{n_steps}] loss {loss_sum.item():.3e} '
+                             f'inlier_prob {prob_sum.item():.3f} data {t_data / k:.4f}s train {(t_all - t_data) / k:.4f}s')
+                t_data = t_all = 0.0
+            if n < self.args.iter_size:
+                logging.info(f'epoch {epoch}: buffer exhausted after {step + 1} of {n_steps} steps')
+                return
 
-            batch_total_loss = batch_total_loss.item()
-            batch_prob_loss  = batch_prob_loss.item()
-            total_loss += batch_total_loss
-            total_num  += 1.0
-            total_timer.toc()
-            data_meter.update(data_time)
-
-            if curr_iter % self.config.print_freq == 0:
-                self.writer.add_scalar('train/total_loss', batch_total_loss, start_iter + curr_iter)
-                self.writer.add_scalar('train/prob_loss',  batch_prob_loss,  start_iter + curr_iter)
-                logging.info(
-                    f'Train Epoch: {epoch} [{curr_iter}/{n_steps}]'
-                    f'  Loss: {batch_total_loss:.3e}'
-                    f'  InlierProb: {batch_prob_loss:.3f}'
-                    f'  DataT: {data_meter.avg:.4f}'
-                    f'  TrainT: {total_timer.avg - data_meter.avg:.4f}'
-                )
-                data_meter.reset()
-                total_timer.reset()
-            if exhausted:
-                logging.info(f'Train Epoch: {epoch} buffer exhausted after '
-                             f'{curr_iter + 1} steps ({n_steps} nominal)')
-                break
-
-    def _valid_epoch(self):
+    @torch.no_grad()
+    def validate(self):
+        """Mean % of GT correspondences among the plan's top-100 entries.  Pairs whose plucker1 has more than 3000
+        lines are skipped, as in every recorded run (the check was written for an inlier count and has always read
+        the line count), so best_val stays comparable across runs."""
         self.model.eval()
-        num_data   = 0
-        data_timer = Timer()
-        match_timer = Timer()
-
-        tot_num_data = len(self.val_data_loader.dataset)
-        if self.val_max_iter > 0:
-            tot_num_data = min(self.val_max_iter, tot_num_data)
-
-        data_loader_iter = iter(self.val_data_loader)
-
-        measure_list = ['err_q', 'err_t', 'err_s', 'inlier_ratio']
-        eval_res = {m: np.zeros(tot_num_data) for m in measure_list}
-
-        for batch_idx in range(tot_num_data):
-            data_timer.tic()
-            matches, plucker1, plucker2, R_gt, t_gt, s_gt = next(data_loader_iter)
-            data_timer.toc()
-
-            nb_plucker = matches.size(1)
-            if nb_plucker > 3000 or nb_plucker < 2:
+        ratios = []
+        for i, (C, p1, p2) in enumerate(self.val_loader):
+            if self.args.val_max_iter > 0 and i >= self.args.val_max_iter:
+                break
+            if not 2 <= C.shape[1] <= 3000:
                 continue
-
-            matches      = matches.to(self.device)
-            plucker1_raw = plucker1.to(self.device)
-            plucker2_raw = plucker2.to(self.device)
-
-            match_timer.tic()
-            prob_matrix, prior1, prior2 = self.net(plucker1_raw, plucker2_raw)
-            match_timer.toc()
-
-            k = min(100, round(plucker1.size(1) * plucker2.size(1)))
-
-            _, P_topk_i     = torch.topk(prob_matrix.flatten(start_dim=-2), k=k,
-                                          dim=-1, largest=True, sorted=True)
-            plucker1_indices = P_topk_i // prob_matrix.size(-1)
-            plucker2_indices = P_topk_i  % prob_matrix.size(-1)
-
-            # Defaults for failure cases
-            err_q        = np.pi
-            err_t        = np.inf
-            err_s        = np.inf
-            inlier_ratio = 0.0
-
-            if k > 3:
-                inlier_inds  = matches[:, plucker1_indices, plucker2_indices].cpu().numpy()
-                inlier_ratio = np.sum(inlier_inds) / k * 100.0
-
-            num_data += 1
-
-            eval_res['err_q'][batch_idx]        = err_q
-            eval_res['err_t'][batch_idx]        = err_t
-            eval_res['err_s'][batch_idx]        = err_s
-            eval_res['inlier_ratio'][batch_idx] = inlier_ratio
-
-            if num_data % 100 == 0 or num_data == tot_num_data:
-                logging.info(
-                    f'Val {num_data}/{tot_num_data} '
-                    f'DataT: {data_timer.avg:.3f}  MatchT: {match_timer.avg:.3f} '
-                    f'running_avg_inlier_ratio: '
-                    f'{eval_res["inlier_ratio"][:batch_idx + 1].mean():.1f}%'
-                )
-            data_timer.reset()
-
-        stats = self._summarise(eval_res)
-
-        logging.info(
-            f'med_rot: {stats["med_rot"]:.2f}°  '
-            f'med_trans: {stats["med_trans"]:.3f}  '
-            f'med_scale_err(log): {stats["med_scale_err"]:.3f}  '
-            f'avg_inlier_ratio: {stats["avg_inlier_ratio"]:.1f}%'
-        )
-
-        return stats
-
-    def _summarise(self, eval_res: dict) -> dict:
-        """Aggregate per-sample eval results into epoch-level stats."""
-        n = max(1, (eval_res['inlier_ratio'] > 0).sum())
-        return {
-            'med_rot':         float(np.median(eval_res['err_q']) * 180 / np.pi),
-            'med_trans':       float(np.median(eval_res['err_t'][np.isfinite(eval_res['err_t'])])
-                                     if np.any(np.isfinite(eval_res['err_t'])) else np.inf),
-            'med_scale_err':   float(np.median(eval_res['err_s'][np.isfinite(eval_res['err_s'])])
-                                     if np.any(np.isfinite(eval_res['err_s'])) else np.inf),
-            'avg_inlier_ratio': float(np.mean(eval_res['inlier_ratio'])),
-        }
+            P = self.net(p1.to(self.device), p2.to(self.device))[0].flatten(1)
+            k = min(100, P.shape[1])
+            top = P.topk(k, dim=-1).indices[0]
+            ratios.append(float(C.flatten(1)[0, top.cpu()].sum()) / k * 100.0 if k > 3 else 0.0)
+        v = float(np.mean(ratios)) if ratios else 0.0
+        logging.info(f'avg_inlier_ratio {v:.1f}% over {len(ratios)} pairs')
+        return v

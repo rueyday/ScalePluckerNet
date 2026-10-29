@@ -1,442 +1,85 @@
 #!/usr/bin/env python3
+"""Train the matcher (lib/model.py).  The defaults ARE the shipped recipe (v102):
+
+    python train.py --dataset synthetic_fsp5q8k --name <run> --live [--gpu_mem_frac 0.7]
+
+Data: --live generates every epoch's pairs with fullrange_sp5_gen.py; without it, the written split
+<data_dir>/<dataset>_train.  Validation always reads <data_dir>/<dataset>_valid.  Resume a run with
+--resume output/<dataset>/<run>/checkpoint.pth; warm-start the weights only with --init_from <ckpt>.
 """
-train.py — ScalePluckerNet training entry point.
-
-Trains on pre-generated .pkl datasets.
---dataset selects the split name: joint | slam_map | semantic3D | structured3D | ...
-
-Examples
---------
-# Standard training (the shipped configuration -- there are no architecture
-# flags left; the encoder is the Grassmannian one described in lib/model.py):
-FOUND=1 INDOOR=1 MONO=1 DEALIAS=1 python train.py --dataset synthetic_found8 \
-    --bucket_batch --match_w 0.2 --batch 1 --iter_size 32 --lr 5e-4 \
-    --gamma 0.99 --train_epoch_size 32000 --name v69_clean
-
-# Resume a run:
-python train.py --dataset synthetic_found6 --name v33_hemi \
-    --resume output/synthetic_found6/v33_hemi/checkpoint.pth
-"""
-import os
-import sys
-import random
+import argparse
 import logging
-from datetime import date
+import os
+import random
+import sys
 
 import numpy as np
 import torch
-import torch.backends.cudnn as cudnn
-import torch.optim as optim
-from torch.utils.data import RandomSampler
-import torch.optim.lr_scheduler as lr_sched
 from torch.utils.data import DataLoader
-from easydict import EasyDict as edict
 
-sys.path.insert(0, os.path.dirname(__file__))
-
-from lib.dataloader import Sim3PluckerData, variable_collate
-from lib.trainer import Sim3Trainer
-
-logging.basicConfig(
-    format='%(asctime)s %(message)s',
-    datefmt='%m/%d %H:%M:%S',
-    handlers=[logging.StreamHandler(sys.stdout)],
-)
-logging.getLogger().setLevel(logging.INFO)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from lib.dataloader import BucketBatchSampler, LiveData, PairData, collate  # noqa: E402
+from lib.trainer import Trainer  # noqa: E402
 
 
 def parse_args():
-    import argparse
-    p = argparse.ArgumentParser(description='ScalePlueckerNet training')
-
-    # Data
-    p.add_argument('--dataset',     default='joint',
-                   help='Dataset name (joint | slam_map | semantic3D | structured3D | ...)')
-    p.add_argument('--val_dataset', default=None,
-                   help='Validation dataset name (default: same as --dataset)')
-    p.add_argument('--data_dir',    default='./dataset')
-    p.add_argument('--n_lines',     type=int, default=700,
-                   help='Lines per scene after subsampling.')
-    p.add_argument('--n_inliers',   type=int, default=490,
-                   help='GT inliers per scene.')
-
-    # Training
-    p.add_argument('--train_epoch_size', type=int, default=0,
-                   help='If > 0, each epoch samples this many pairs with '
-                        'replacement from the full dataset (keeps epochs short on large datasets). '
-                        '0 = use the full dataset per epoch.')
-    p.add_argument('--epochs',     type=int,   default=1000)
-    p.add_argument('--batch',      type=int,   default=1,
-                   help='Batch size. Default 1 for variable-length pairs; '
-                        'use variable_collate (automatic) for batch > 1.')
-    p.add_argument('--iter_size',  type=int,   default=32,
-                   help='Gradient accumulation steps (effective batch = batch × iter_size).')
-    p.add_argument('--lr',         type=float, default=5e-4)
-    p.add_argument('--gamma',      type=float, default=0.99,
-                   help='ExponentialLR decay per epoch (default: 0.99). Use 1.0 to disable.')
-    p.add_argument('--gpu',        type=int,   default=0)
-    p.add_argument('--workers',    type=int,   default=8)
-    p.add_argument('--name',       default=None,
-                   help='Override run name (default: today\'s date)')
-
-    # Extensions
-    p.add_argument('--cosine_lr',  action='store_true',
-                   help='CosineAnnealingWarmRestarts instead of ExponentialLR')
-    p.add_argument('--pose_loss',  type=float, default=0.0,
-                   help='Weight for differentiable Sim(3) pose loss (0 = disabled)')
-
-    # Validation RANSAC backend
-    p.add_argument('--ransac',  default='grassmannian', choices=['sim3', 'grassmannian'],
-                   help='RANSAC solver for validation metrics (default: grassmannian)')
-    p.add_argument('--val_max_iter', type=int, default=-1,
-                   help='Max validation samples per epoch (-1 = all)')
-    p.add_argument('--metric',  default='avg_inlier_ratio',
-                   choices=['avg_inlier_ratio'],
-                   help='Metric used to pick the best checkpoint')
-
-    # Checkpointing
-    p.add_argument('--pretrain', default=None,
-                   help='Warm-start from checkpoint (strict=False)')
-    p.add_argument('--resume',   default=None,
-                   help='Resume training from checkpoint')
-
-    p.add_argument('--nchannel', type=int, default=128,
-                   help='network channel width (v19=128; 256 ~4x params)')
-    p.add_argument('--gnn_pairs', type=int, default=6,
-                   help='num self+cross GNN layer pairs (v19=6 -> 12 layers)')
-
-    p.add_argument('--attn_heads', type=int, default=4,
-                   help='attention heads in the GNN (default 4 = upstream; '
-                        '1 = single-head ablation, same param count)')
-    
-    p.add_argument('--live', action='store_true',
-                   help='Generate training pairs on the fly: infinite unique pairs, '
-                        'no repetition, ~15 GB less host RAM. One epoch is buffered '
-                        'so BucketBatchSampler still works; the next is prefetched '
-                        'asynchronously (192 pairs/s at 6 workers vs 62/s consumed).')
-    p.add_argument('--live_workers', type=int, default=6)
-    p.add_argument('--live_loader_workers', type=int, default=0,
-                   help='DataLoader workers in --live mode (default 0 = main process). MEASURED '
-                        '2026-09-29 on v82: 0 workers cost 0.3-0.5 s of DataT per 32-sample '
-                        'iteration (dense match matrices + padding on the main thread); fork '
-                        'workers read the per-epoch buffer copy-on-write and are recreated each '
-                        'epoch (non-persistent), so they always see the fresh buffer.')
-    p.add_argument('--val_epoch_freq', type=int, default=1,
-                   help='run validation every N epochs (default 1). Validation '
-                        'measured at only 4.8%% of epoch wall time, so 2 buys '
-                        '~2.4%% — it does NOT change the LR schedule or the '
-                        'epoch definition, unlike enlarging train_epoch_size.')
-    p.add_argument('--batch_budget', type=int, default=4096,
-                   help='bucket batch = budget // max(n1,n2), capped by '
-                        '--max_bucket (default 4096 = pre-2026-08-22 behaviour)')
-    p.add_argument('--max_bucket', type=int, default=16,
-                   help='hard cap on per-bucket batch size (default 16)')
-    p.add_argument('--mem_budget', type=int, default=0,
-                   help='SECOND, QUADRATIC cap: batch <= mem_budget // n^2. '
-                        '0 = off. Attention cost is O(B*n^2), so the linear '
-                        'budget under-batches small clouds and over-batches '
-                        'large ones. 8400000 gives B=32 at n=512 (+52%% '
-                        'throughput) while keeping n>=2460 at B=1.')
-    p.add_argument('--init_from', default=None,
-                   help='checkpoint to initialize WEIGHTS from (fresh '
-                        'optimizer/scheduler/epoch counter — unlike --resume). '
-                        'For warm-starting on a new dataset mix.')
-    # ONE encoder. `graff` and `ordinal` remain in lib/model.py as LOAD-ONLY
-    # paths for v74/v19 and v84/v81 respectively, but new runs get ordinal_q.
-    p.add_argument('--encoder', default='ordinal_q', choices=['ordinal_q'],
-                   help='quantile-rank ordinal shape context (the shipped encoder)')
-    p.add_argument('--match_w', type=float, default=0.0,
-                   help='weight of the matchability loss on the Sinkhorn '
-                        'marginal heads r/c (v21: 0.2). 0 = off (pre-v21).')
-    p.add_argument('--bucket_batch', action='store_true',
-                   help='group same-shape (n1,n2) pairs into batches '
-                        '(requires a FOUND size-grid dataset). The model is '
-                        'latency-bound below ~1.5k lines, so this is ~2-4x '
-                        'wall-clock at identical sum-over-samples gradients.')
-
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument('--dataset', required=True)
+    p.add_argument('--name', required=True, help='run name: output/<dataset>/<name>/')
+    p.add_argument('--data_dir', default='./dataset')
+    p.add_argument('--out_dir', default='output')
+    p.add_argument('--resume', help='checkpoint to resume (weights, optimizer, schedule, epoch)')
+    p.add_argument('--init_from', help='checkpoint to take the weights from, with a fresh optimizer and schedule')
+    p.add_argument('--live', action='store_true', help='generate fresh training pairs every epoch')
+    p.add_argument('--live_workers', type=int, default=8, help='generator processes')
+    p.add_argument('--epochs', type=int, default=200)
+    p.add_argument('--train_epoch_size', type=int, default=32000, help='pairs per epoch (0 = the whole split)')
+    p.add_argument('--lr', type=float, default=5e-4, help='cosine from lr to 1e-6 over the run')
+    p.add_argument('--iter_size', type=int, default=32, help='samples per optimizer step')
+    p.add_argument('--match_w', type=float, default=0.2, help='weight of the matchability loss')
+    p.add_argument('--max_lines', type=int, default=6000, help='cap per cloud, keeping every matched line')
+    p.add_argument('--batch_budget', type=int, default=16384, help='bucket batch <= budget // n')
+    p.add_argument('--max_bucket', type=int, default=32, help='bucket batch <= max_bucket')
+    p.add_argument('--mem_budget', type=int, default=8400000, help='bucket batch <= mem_budget // n^2 (0 = off)')
+    p.add_argument('--workers', type=int, default=2, help='DataLoader workers')
+    p.add_argument('--val_epoch_freq', type=int, default=1)
+    p.add_argument('--val_max_iter', type=int, default=-1, help='validation pairs per epoch (-1 = all)')
+    p.add_argument('--gpu', type=int, default=0)
+    p.add_argument('--gpu_mem_frac', type=float, default=0.0, help='cap this process at this share of GPU memory')
+    p.add_argument('--seed', type=int, default=0)
     return p.parse_args()
-
-
-class BucketBatchSampler(torch.utils.data.Sampler):
-    """Batch sampler grouping same-shape (n1, n2) pairs (FOUND grid data).
-
-    Per-bucket batch size: max(1, min(max_b, budget // max(n1, n2))) — 256-line
-    pairs batch 16 deep, 4096-line pairs run alone. Each epoch draws
-    epoch_size indices without replacement and shuffles the batch order."""
-
-    def __init__(self, shapes, epoch_size, budget=4096, max_b=16, seed=0,
-                 mem_budget=0):
-        self.shapes = shapes
-        self.epoch_size = (min(epoch_size, len(shapes)) if epoch_size > 0
-                           else len(shapes))
-        self.budget, self.max_b = budget, max_b
-        # mem_budget (0 = off, preserves the pre-2026-08-22 behaviour exactly):
-        # a SECOND cap that is QUADRATIC in n, because attention memory/compute
-        # is O(B * n^2) while `budget // n` is only linear. Measured on the
-        # RTX 5090: n=512 gains +52% going B 8->32 (157->239 samples/s) but
-        # n=1094 gains NOTHING (52.4->52.8) and n>=2460 would OOM. So the linear
-        # rule under-batches small clouds and over-batches large ones.
-        self.mem_budget = mem_budget
-        self.seed, self.epoch = seed, 0
-        self.live_ds = None
-
-    def _batch_size(self, n1, n2):
-        n = max(n1, n2)
-        b = self.budget // n
-        if self.mem_budget:
-            b = min(b, self.mem_budget // (n * n))
-        return max(1, min(self.max_b, b))
-
-    def start_epoch(self, epoch):
-        """Call ONCE per epoch, BEFORE iter(loader) (the trainer does).
-
-        LIVE: swap in the prefetched buffer and re-read its shapes. This used
-        to live inside __iter__, which is WRONG with --live_loader_workers > 0
-        (2026-09-29, v83 OOM x3 at the same iteration): torch's DataLoader
-        calls iter(sampler) TWICE per iter(loader) -- once in __init__ before
-        it forks the workers and again in _reset() after -- so the second call
-        swapped the buffer in the parent only. The workers then served the OLD
-        buffer at indices the parent had bucketed by the NEW shapes:
-        mixed-shape buckets, zero-padded by variable_collate up to 2048 lines
-        at B=32 -> a 2 GiB attention tensor. __iter__ is now a pure function of
-        (shapes, epoch), so both calls yield the same batch list."""
-        self.epoch = int(epoch)
-        if getattr(self, 'live_ds', None) is not None:
-            self.live_ds.regenerate()
-            self.shapes = self.live_ds.shapes()
-
-    def __iter__(self):
-        rng = np.random.default_rng(self.seed + self.epoch)
-        idx = rng.choice(len(self.shapes), self.epoch_size, replace=False)
-        groups = {}
-        for i in idx:
-            groups.setdefault(self.shapes[i], []).append(int(i))
-        batches = []
-        for (n1, n2), ids in groups.items():
-            B = self._batch_size(n1, n2)
-            batches.extend(ids[j:j + B] for j in range(0, len(ids), B))
-        order = rng.permutation(len(batches))
-        return iter([batches[j] for j in order])
-
-    def __len__(self):
-        # estimate; the trainer paces itself by loader.epoch_samples
-        groups = {}
-        for sh in self.shapes:
-            groups[sh] = groups.get(sh, 0) + 1
-        frac = self.epoch_size / max(1, len(self.shapes))
-        return max(1, int(sum(
-            np.ceil(cnt * frac / self._batch_size(*sh))
-            for sh, cnt in groups.items())))
 
 
 def main():
     args = parse_args()
-
-    # TF32 matmuls: free throughput on Ampere+ GPUs, safe for training
+    logging.basicConfig(format='%(asctime)s %(message)s', datefmt='%m/%d %H:%M:%S', level=logging.INFO,
+                        handlers=[logging.StreamHandler(sys.stdout)])
+    if args.gpu_mem_frac > 0:
+        torch.cuda.set_per_process_memory_fraction(args.gpu_mem_frac, args.gpu)
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-
-    val_dataset = args.val_dataset or args.dataset
-
-    configs = edict(
-        # Network
-        net_nchannel       = args.nchannel,
-        GNN_layers         = ['self', 'cross'] * args.gnn_pairs,
-        net_lambda         = 0.1,
-        net_maxiter        = 30,
-        attn_heads         = args.attn_heads,
-        # Training
-        out_dir            = 'output',
-        optimizer          = 'Adam',
-        train_start_epoch  = 0,
-        train_save_freq_epoch = 1,
-        val_epoch_freq     = args.val_epoch_freq,
-        # bucket-batch packing (2026-08-22). MUST be listed here: `configs` is
-        # an EXPLICIT edict, not vars(args), so a CLI flag that is not copied in
-        # silently falls back to the sampler defaults and the run looks
-        # IDENTICAL (caught only by the unchanged batches/epoch line).
-        batch_budget       = args.batch_budget,
-        max_bucket         = args.max_bucket,
-        mem_budget         = args.mem_budget,
-        use_gpu            = True,
-        print_freq         = 10,
-        train_seed         = 0,
-        # Set from args
-        dataset            = args.dataset,
-        data_dir           = args.data_dir,
-        gpu_inds           = args.gpu,
-        model_nb           = args.name if args.name else str(date.today()),
-        train_batch_size   = args.batch,
-        iter_size          = args.iter_size,
-        train_lr           = args.lr,
-        exp_gamma          = args.gamma,
-        train_epoches      = args.epochs,
-        best_val_metric    = args.metric,
-        ransac_type        = args.ransac,
-        val_max_iter       = args.val_max_iter,
-        resume_dir         = None,
-        in_channel         = 6,
-        pose_loss_weight   = args.pose_loss,
-        resume             = args.resume,
-        match_w            = args.match_w,
-        encoder            = args.encoder,
-    )
-
-    if configs.train_seed is not None:
-        random.seed(configs.train_seed)
-        torch.manual_seed(configs.train_seed)
-        torch.cuda.manual_seed(configs.train_seed)
-        cudnn.deterministic = True
-
-    logging.info('===> ScalePlueckerNet Training')
-    logging.info(f'  dataset     : {args.dataset}')
-    logging.info(f'  val_dataset : {val_dataset}')
-    logging.info(f'  cosine_lr   : {args.cosine_lr}')
-    logging.info(f'  ransac      : {args.ransac}')
-    logging.info(f'  metric      : {args.metric}')
-    logging.info(f'  pose_loss   : {args.pose_loss}')
-    logging.info(f'  batch       : {args.batch}  iter_size: {args.iter_size}  '
-                 f'(effective batch: {args.batch * args.iter_size})')
-
-    # ── Build data loaders ────────────────────────────────────────────────────
-    collate = variable_collate if args.batch > 1 else None
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    torch.backends.cudnn.deterministic = True
 
     if args.live:
-        from lib.dataloader import Sim3LiveData
-        _ep = args.train_epoch_size if args.train_epoch_size > 0 else 19200
-        logging.info(f'  [live] generating first epoch ({_ep} pairs, '
-                     f'{args.live_workers} workers)...')
-        train_dataset = Sim3LiveData(configs, _ep, workers=args.live_workers,
-                                     seed=configs.train_seed or 0)
-        logging.info('  [live] ready; next epoch prefetches during training')
+        n = args.train_epoch_size or 32000
+        logging.info(f'generating the first epoch ({n} pairs, {args.live_workers} workers)')
+        train = LiveData(n, workers=args.live_workers, seed=args.seed, max_lines=args.max_lines)
     else:
-        train_dataset = Sim3PluckerData(phase='train', config=configs)
-
-    if args.bucket_batch:
-        shapes = [(len(p1), len(p2)) for p1, p2 in
-                  zip(train_dataset.data['plucker1'],
-                      train_dataset.data['plucker2'])]
-        n_shapes = len(set(shapes))
-        epoch_size = args.train_epoch_size if args.train_epoch_size > 0 \
-            else len(train_dataset)
-        sampler = BucketBatchSampler(shapes, epoch_size,
-                                     budget=getattr(configs, 'batch_budget', 4096),
-                                     max_b=getattr(configs, 'max_bucket', 16),
-                                     mem_budget=getattr(configs, 'mem_budget', 0),
-                                     seed=configs.train_seed or 0)
-        if args.live:
-            # the trainer calls sampler.start_epoch() -> buffer swap + shapes
-            sampler.live_ds = train_dataset
-            sampler.epoch_size = min(epoch_size, len(train_dataset))
-        logging.info(f'  bucket_batch: {n_shapes} distinct shapes, '
-                     f'~{len(sampler)} batches/epoch for {epoch_size} samples')
-        train_loader = DataLoader(
-            train_dataset,
-            batch_sampler=sampler,
-            num_workers=(args.live_loader_workers if args.live else args.workers), pin_memory=True,
-            persistent_workers=(args.workers > 0 and not args.live),
-            collate_fn=variable_collate,
-        )
-        train_loader.epoch_samples = epoch_size
-    elif args.train_epoch_size > 0:
-        train_sampler = RandomSampler(train_dataset,
-                                      replacement=True,
-                                      num_samples=args.train_epoch_size)
-        logging.info(f'  train_epoch_size: {args.train_epoch_size} '
-                     f'(dataset has {len(train_dataset)} pairs)')
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=configs.train_batch_size,
-            sampler=train_sampler, drop_last=True,
-            num_workers=args.workers, pin_memory=True,
-            persistent_workers=(args.workers > 0),
-            collate_fn=collate,
-        )
-    else:
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=configs.train_batch_size,
-            shuffle=True, drop_last=True,
-            num_workers=args.workers, pin_memory=True,
-            persistent_workers=(args.workers > 0),
-            collate_fn=collate,
-        )
-
-    val_cfg = edict(dict(configs))
-    val_cfg.dataset = val_dataset
-    val_dataset_obj = Sim3PluckerData(phase='valid', config=val_cfg)
-    val_loader = DataLoader(
-        val_dataset_obj,
-        batch_size=1, shuffle=False, drop_last=False,
-        num_workers=2, pin_memory=True, persistent_workers=True,
-    )
-
-    # ── Build trainer ─────────────────────────────────────────────────────────
-    trainer = Sim3Trainer(configs, train_loader, val_loader)
-    if args.init_from:
-        state = torch.load(args.init_from, map_location='cpu',
-                           weights_only=False)
-        trainer.model.load_state_dict(state['state_dict'])
-        logging.info(f'initialized weights from {args.init_from} '
-                     f'(epoch {state.get("epoch", "?")}, fresh optimizer)')
-
-    # ── Load pretrained weights (non-strict, for fine-tuning) ─────────────────
-    if args.pretrain and os.path.exists(args.pretrain):
-        ckpt = torch.load(args.pretrain, map_location='cpu', weights_only=False)
-        state = ckpt.get('model', ckpt.get('state_dict', ckpt))
-        missing, unexpected = trainer.model.load_state_dict(state, strict=False)
-        logging.info(f'Loaded pretrain: {args.pretrain}')
-        if missing:
-            logging.info(f'  Missing (re-init): {missing}')
-        if unexpected:
-            logging.info(f'  Unexpected (skipped): {unexpected}')
-    elif args.pretrain:
-        logging.warning(f'Pretrain not found: {args.pretrain}')
-
-    # ── Scheduler ─────────────────────────────────────────────────────────────
-    # On resume, trainer.start_epoch already reflects the checkpoint's epoch
-    # (set in Sim3Trainer.__init__), but a freshly constructed ExponentialLR
-    # does NOT retroactively recompute lr from `last_epoch` at __init__ time
-    # in this torch build (get_lr() returns the current, unmultiplied lr on
-    # the initial step) — so the resumed lr must be set explicitly, or every
-    # resume silently kicks the LR back up to args.lr instead of continuing
-    # to anneal from wherever it had decayed to.
-    resume_last_epoch = trainer.start_epoch - 1 if args.resume else -1
-    resumed_lr = (args.lr * (trainer.config.exp_gamma ** trainer.start_epoch)
-                 if args.resume else args.lr)
-    for pg in trainer.optimizer.param_groups:
-        pg['lr'] = resumed_lr
-        pg['initial_lr'] = args.lr
-    trainer.scheduler = lr_sched.ExponentialLR(trainer.optimizer,
-                                               gamma=trainer.config.exp_gamma,
-                                               last_epoch=resume_last_epoch)
-    if resume_last_epoch >= 0:
-        logging.info(f'Resumed ExponentialLR at epoch {trainer.start_epoch}: '
-                     f'lr={resumed_lr:.3e} (= {args.lr:.1e} * '
-                     f'{trainer.config.exp_gamma}^{trainer.start_epoch})')
-
-    if args.cosine_lr:
-        # Single cosine anneal over the whole run (T_mult=1, T_0=epochs):
-        # lr goes args.lr -> eta_min across epochs 0..args.epochs, landing the
-        # anneal exactly at the horizon. On resume, align the cosine phase to the
-        # model epoch via last_epoch (the old ckpt's ExponentialLR state is
-        # incompatible, so we reconstruct rather than load it). initial_lr was
-        # set on every param group above, which cosine needs as its base_lr.
-        cos_last_epoch = (trainer.start_epoch - 1) if args.resume else -1
-        # T_0 = epochs + 1, NOT epochs: the trainer runs epochs 0..epochs
-        # INCLUSIVE (range(start, max_epoch + 1)), and WarmRestarts wraps
-        # T_cur to 0 when epoch == T_0, so with T_0 = epochs the LAST epoch
-        # trained at the full base LR (v84_cos: "Epoch: 200, LR: [0.0005]",
-        # val 20.7 -> 16.9; same dip at epoch 10 of the 10-epoch chain).
-        # best_val was unaffected; checkpoint.pth of that last epoch was.
-        trainer.scheduler = lr_sched.CosineAnnealingWarmRestarts(
-            trainer.optimizer, T_0=args.epochs + 1, T_mult=1, eta_min=1e-6,
-            last_epoch=cos_last_epoch,
-        )
-        logging.info(f'Scheduler: CosineAnnealingWarmRestarts(T_0={args.epochs + 1}, '
-                     f'T_mult=1, eta_min=1e-6, last_epoch={cos_last_epoch})')
-
-    trainer.train()
+        train = PairData(os.path.join(args.data_dir, f'{args.dataset}_train'), args.max_lines)
+    sampler = BucketBatchSampler(train, args.train_epoch_size, args.batch_budget, args.max_bucket, args.mem_budget,
+                                 args.seed)
+    # live: workers fork per epoch (not persistent) so they read the fresh buffer copy-on-write
+    train_loader = DataLoader(train, batch_sampler=sampler, num_workers=args.workers, pin_memory=True,
+                              persistent_workers=args.workers > 0 and not args.live, collate_fn=collate)
+    val = PairData(os.path.join(args.data_dir, f'{args.dataset}_valid'), args.max_lines)
+    val_loader = DataLoader(val, batch_size=1, num_workers=2, pin_memory=True, persistent_workers=True,
+                            collate_fn=collate)
+    logging.info(f'{args.name}: {sampler.epoch_size} pairs/epoch, {len(set(sampler.shapes))} shapes, '
+                 f'{args.epochs} epochs, {"live" if args.live else "file-backed"}')
+    Trainer(args, train_loader, val_loader, sampler.epoch_size).train()
 
 
 if __name__ == '__main__':

@@ -6,8 +6,8 @@ Register a query line map onto a reference line map: Sim(3) (R, t, s) from line 
 Each map is (N, 6) segment endpoints [p1 p2] (.npy, .npz with the array first, or whitespace text).
 The result maps query onto reference:  x_ref = s R x_query + t.
 
-Pipeline: segments -> Plücker [m; d] -> merge near-identical lines (lib.line_utils.prepare_lines)
--> uniform cap at 4000 merged lines -> matcher (lib/model.py) -> Sim(3) solver.
+Pipeline: segments -> Plücker [m; d] -> merge near-identical lines (lib.utils.prepare_lines)
+-> uniform sample of 6000 merged lines -> matcher (lib/model.py) -> Sim(3) solver.
 
 The solver is the C++ port (cpp/, built into lib/_sim3_solver_cpp*.so) when it is built, else the
 numpy reference lib/sim3_solver.py; both give the same pose. Build the C++ one with
@@ -17,10 +17,9 @@ numpy reference lib/sim3_solver.py; both give the same pose. Build the C++ one w
 import argparse
 import numpy as np
 import torch
-from easydict import EasyDict
 
-from lib.line_utils import segments_to_plucker, prepare_lines
-from lib.utils import load_model
+from lib.model import load_matcher
+from lib.utils import segments_to_plucker, prepare_lines
 from lib import sim3_solver
 
 try:
@@ -28,7 +27,7 @@ try:
 except ImportError:
     _sim3_solver_cpp = None
 
-MAX_LINES = 4000      # the training size
+MAX_LINES = 6000      # merged lines per map, uniformly sampled above it (also the training cap)
 
 
 def solve_sim3(p_q, p_r, prob, topk=300, nsamp=3000, proj_thresh=1.984,
@@ -45,25 +44,6 @@ def solve_sim3(p_q, p_r, prob, topk=300, nsamp=3000, proj_thresh=1.984,
                                        refit_iters=refit_iters, sx_max=sx_max, samples=T)
 
 
-def load_matcher(ckpt, device):
-    """The shipped matcher with a checkpoint's weights. Only SIZE and the encoder are read from the
-    checkpoint config; a weight the checkpoint cannot fill is an error, never a silent random init."""
-    state = torch.load(ckpt, weights_only=False, map_location='cpu')
-    ck = dict(state.get('config', {}) or {})
-    layers = list(ck.get('GNN_layers') or ['self', 'cross'] * 6)
-    cfg = EasyDict(dict(model='KNNContextNormNet', normalize_n_lines=200, normalize_n_inliers=60,
-                        net_depth=len(layers), net_nchannel=int(ck.get('net_nchannel', 128)), GNN_layers=layers,
-                        net_gcnorm=True, net_batchnorm=True, net_topK=2000, net_lambda=0.1, net_maxiter=30,
-                        net_knn=10, in_channel=6, attn_heads=int(ck.get('attn_heads', 4)),
-                        encoder=ck.get('encoder', 'graff'), ordinal_nums=ck.get('ordinal_nums'),
-                        use_gpu=device.type == 'cuda', gpu_inds=0))
-    model = load_model('PluckerNetKnn')(cfg).to(device)
-    missing, _ = model.load_state_dict(state.get('state_dict', state), strict=False)
-    if missing:
-        raise RuntimeError(f'{ckpt}: {len(missing)} weights missing from the checkpoint, e.g. {list(missing)[:3]}')
-    return model.eval()
-
-
 def prepare(segments, seed=0):
     """(N, 6) endpoints -> the Plücker lines the matcher and the solver see."""
     P = prepare_lines(segments_to_plucker(segments[:, :3], segments[:, 3:6]))
@@ -74,11 +54,9 @@ def prepare(segments, seed=0):
 
 @torch.no_grad()
 def match(model, p_q, p_r, device):
-    """Matcher probabilities (len(p_r), len(p_q)). Input normalization: both clouds' moments divided by
-    the query moment std (unit-free, keeps the query/reference scale ratio)."""
-    std = float(p_q[:, :3].std()) + 1e-6
-    w = lambda p: torch.from_numpy(np.concatenate([p[:, :3] / std, p[:, 3:]], 1).astype(np.float32))[None].to(device)
-    return model(w(p_r), w(p_q))[0][0].float().cpu().numpy()
+    """Matcher probabilities (len(p_r), len(p_q)).  No input normalization: the matcher is Sim(3)-invariant."""
+    t = lambda p: torch.from_numpy(np.asarray(p, np.float32))[None].to(device)
+    return model(t(p_r), t(p_q))[0][0].float().cpu().numpy()
 
 
 def register(query_segments, reference_segments, model, device, seed=0):
