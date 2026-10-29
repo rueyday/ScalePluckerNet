@@ -127,7 +127,7 @@ def _refit(dq, fq, dr, fr, Yr, R, t, s, thr, iters, sx_max):
     return R, t, float(s)
 
 def solve_sim3(p_q, p_r, prob, topk=300, nsamp=3000, proj_thresh=1.984,
-               skew_min=0.3, seed=0, refit_iters=2, sx_max=1e3):
+               skew_min=0.3, seed=0, refit_iters=3, sx_max=1e3):
     """Sim(3) estimate (R, t, s) from a matcher probability matrix, in the caller's frame."""
     # candidate correspondences = the top-k scores, sorted by index
     k = min(topk, prob.size)

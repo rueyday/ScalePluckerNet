@@ -5,3 +5,5 @@ dataset/
 results/
 CLAUDE.md
 wandb/
+cpp/build/
+lib/_sim3_solver_cpp*.so

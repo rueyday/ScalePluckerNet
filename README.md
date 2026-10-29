@@ -2,7 +2,7 @@
 
 **Sim(3) registration of 3D line maps across sensor modalities.** ScalePluckerNet
 is a scale-aware Plücker line matcher trained on fully synthetic, SLAM-calibrated
-Sim(3) data; paired with the line-based Sim(3) estimator in `lib/sim3_solver.py`
+Sim(3) data; paired with the line-based Sim(3) estimator in `lib/sim3_solver.py` (C++ port in `cpp/`)
 it registers a scale-ambiguous monocular SLAM map onto a metric RGB-D or LiDAR
 line map — recovering scale, rotation and translation from line geometry alone.
 
@@ -59,31 +59,75 @@ conda activate torch5090        # Python 3.11, PyTorch 2.6, CUDA
 pip install easydict msgpack    # + numpy, torch, matplotlib
 ```
 
-Self-contained: network and solver both live in `lib/`; no external service or
-dataset is required to register two maps.
+Self-contained: `registration.py` + `lib/` register two maps with no external service or
+dataset. The C++ solver additionally needs Eigen, CMake and pybind11 (optional).
 
 ## Layout
 
 ```
-lib/model.py           the matcher — ONE encoder, no architecture flags
-lib/sim3_solver.py     THE Sim(3) estimator, one self-contained file
+registration.py        END-TO-END: two line maps -> matcher -> Sim(3) (R, t, s)
+lib/model.py           the matcher -- ONE encoder, no architecture flags
+lib/sim3_solver.py     THE Sim(3) estimator, numpy reference (frozen)
+cpp/                   the same estimator in C++ (header-only, Eigen) + its pybind11 module
+lib/line_utils.py      Plücker conversion + the line-merge preparation (numpy only)
 lib/{trainer,loss,dataloader,utils}.py   training machinery
 generate_synthetic.py  calibrated Sim(3) pair generator
 train.py               training entry point
-(dataset flags + scenario table now live in the parent repo:
-                       docs/scalepluckernet_dataset_flags.md)
-                       before regenerating or comparing against a checkpoint
 output/                checkpoints
 ```
 
-## Library use
+## Registering two maps
+
+```bash
+python registration.py query.npy reference.npy --ckpt output/<dataset>/<run>/best_val_checkpoint.pth
+```
+
+Each map is `(N, 6)` segment endpoints `[p1 p2]`; the result maps the query onto the reference,
+`x_ref = s R x_query + t`. The pipeline: segments -> Plücker -> merge near-identical lines
+(`lib.line_utils.prepare_lines`) -> uniform cap at 4000 lines -> matcher -> solver. It runs on CPU.
 
 ```python
-from lib.sim3_solver import Sim3Solver, solve_sim3
-solver   = Sim3Solver((q1, q2), (r1, r2))   # (N,3) segment endpoints each
-p_q, p_r = solver.matcher_input()           # what the network consumes
-R, t, s  = solve_sim3(solver, prob)         # prob = matcher output
+from registration import load_matcher, register, solve_sim3
+model = load_matcher(ckpt, device)
+R, t, s = register(query_segments, reference_segments, model, device)
+R, t, s = solve_sim3(p_q, p_r, prob)        # the solver alone: Plücker (N,6) [m; d], prob (Nr, Nq)
 ```
+
+## The Sim(3) estimator (frozen 2026-10-29 -- only its defaults may still be tuned)
+
+`solve_sim3(p_q, p_r, prob, topk=300, nsamp=3000, proj_thresh=1.984, skew_min=0.3, seed=0,
+refit_iters=3, sx_max=1e3)`:
+
+1. candidate correspondences = the top-`topk` matcher scores;
+2. `nsamp` random 2-line samples; drop near-parallel pairs, `|d1 x d2| > skew_min` on both maps;
+3. per sample, Kabsch rotation plus its 180-degree flip about reference line 1 (the other relative
+   line sign), then `(t, s)` by least squares on `m_r = s R m_q + t x (R d_q)`;
+4. the hypothesis with the most G(2,4) inliers wins (`||Yq^T Yr||_F^2 > proj_thresh`), counted with an
+   exact early exit;
+5. `refit_iters` closed-form alternating steps on the winner's inliers; a step stops if the scale is
+   degenerate (`Sx / L > sx_max`, which grows like `1/s^2` as the scale collapses).
+
+No normalization, no scale prior, no clamp beyond `s in [1e-3, 1e3]`.
+
+**Two backends, one result.** `lib/sim3_solver.py` is the readable numpy reference. `cpp/` is the
+optimized port, which `registration.solve_sim3` uses whenever the extension is built. It draws the
+samples with numpy exactly as the reference does, so the pose matches: same pose on all 810 ScanNet++
+pairs, **1.2 ms vs 110 ms per pair** single-threaded (~90x). It is the same algorithm: every speed-up
+either skips work that provably cannot change the winner (exact early exit, a direction-only upper bound
+on the inlier count) or scores in float32 with a rounding guard that falls back to double whenever float
+could flip a comparison -- so the selected hypothesis is the double-precision one. The argument is in the
+header comment of `cpp/sim3_solver.hpp`.
+Build:
+
+```bash
+PY=$(which python)
+cmake -S cpp -B cpp/build -DPython_EXECUTABLE=$PY -Dpybind11_DIR=$($PY -m pybind11 --cmakedir)
+cmake --build cpp/build          # -> lib/_sim3_solver_cpp*.so
+```
+
+From C++ directly: `#include "cpp/sim3_solver.hpp"`, `sim3::solve_sim3(p_q, nq, p_r, nr, prob, opts)`.
+Without a `samples` array it uses its own generator, so the same seed gives different samples than
+numpy.
 
 ## Training
 
@@ -194,8 +238,7 @@ separate times.
 All code here uses `[m, d]` order (moment first); the original PlueckerNet uses
 `[d, m]`. Sim(3) law: `d' = R d`, `m' = s·R·m + t × d'`. Lines are sign-ambiguous
 (`[m,d] ~ [−m,−d]`). The **matcher** is invariant by construction (above). The
-**solver** handles it explicitly and still needs to: it canonicalises query
-line 1 and proposes *both* signs of line 2, letting the G(2,4) criterion
-arbitrate — a residual-based sign test is provably blind at 90°, since flipping
-line 2 maps the inter-line angle θ → 180−θ (measured 66.3% agreement in the
-80–90° bin versus 100% at 30–60°).
+**solver** never canonicalizes: foot points `d x m` and the G(2,4) projector are sign-invariant,
+the `(t, s)` solve sign-aligns each line to its reference (`sign((R d_q).d_r)`), and the two
+relative signs of a 2-line sample are both proposed (Kabsch + its 180-degree flip about
+reference line 1), letting the G(2,4) inlier count arbitrate.
