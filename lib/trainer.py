@@ -1,7 +1,8 @@
-"""Training loop for PluckerNetKnn.
+"""Training loop for ScalePluckerNet.
 
 One optimizer step = iter_size SAMPLES (a bucketed batch carries B of them), summed loss, grad-norm clip 1.0, Adam,
-cosine LR from lr to 1e-6 over the run.  Validation reports the share of GT correspondences among the top-100 entries
+cosine LR from lr to 1e-6 over the run
+(or --schedule exp: lr x gamma per epoch, PlueckerNet's).  Validation reports the share of GT correspondences among the top-100 entries
 of the plan (avg_inlier_ratio), which picks best_val_checkpoint.  It is a training monitor only: rank checkpoints by
 registration on the real benchmarks, never by this number.
 """
@@ -14,16 +15,12 @@ import time
 import numpy as np
 import torch
 
-from lib.loss import total_loss
-from lib.model import HEADS, LAYERS, WIDTH, PluckerNetKnn
+from lib.loss import plan_bce
+from lib.model import HEADS, LAYERS, WIDTH, ScalePluckerNet
 
 
 class _Writer:
-    """TensorBoard, mirrored to Weights & Biases when WANDB=1 (needs `wandb login`).
-
-    TensorBoard keeps a step series per tag; wandb has ONE global counter and rejects negative steps, while train/*
-    is logged per ITERATION (epoch 0 starts at -steps) and val/* per EPOCH.  So wandb gets both on an `epoch` axis.
-    The wandb run id is md5(run name), so restarts and tools/wandb_backfill.py update the same run."""
+    """Logs one number per (tag, step) to TensorBoard, mirrored to Weights & Biases when WANDB=1."""
 
     def __init__(self, logdir, config):
         from tensorboardX import SummaryWriter
@@ -41,7 +38,7 @@ class _Writer:
         except Exception as e:
             logging.warning(f'wandb disabled ({type(e).__name__}: {e})')
 
-    def add_scalar(self, tag, value, step):
+    def log(self, tag, value, step):
         self.tb.add_scalar(tag, value, step)
         if self.wb is not None:
             ep = step / self.steps_per_epoch + 1.0 if tag.startswith('train/') else float(step)
@@ -56,17 +53,19 @@ class Trainer:
         self.args, self.train_loader, self.val_loader, self.epoch_size = args, train_loader, val_loader, epoch_size
         self.device = torch.device('cuda', args.gpu)
         torch.cuda.set_device(self.device)
-        self.model = PluckerNetKnn().to(self.device)
+        self.model = ScalePluckerNet().to(self.device)
         # compiled handle for forward passes (~1.5x on this launch-overhead-bound model); checkpoints are saved from
         # self.model so their keys carry no _orig_mod. prefix
         self.net = torch.compile(self.model, dynamic=True)
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=args.lr)
-        # T_0 = epochs + 1: epochs 0..epochs are trained (inclusive), and WarmRestarts would restart the LR at T_0
-        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            self.optimizer, T_0=args.epochs + 1, T_mult=1, eta_min=1e-6)
+        if args.schedule == 'exp':
+            self.scheduler = torch.optim.lr_scheduler.ExponentialLR(self.optimizer, args.gamma)
+        else:   # T_0 = epochs + 1: epochs 0..epochs are trained (inclusive), WarmRestarts would restart at T_0
+            self.scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+                self.optimizer, T_0=args.epochs + 1, T_mult=1, eta_min=1e-6)
         self.start_epoch, self.best_val, self.best_val_epoch = 0, -np.inf, -1
         # the architecture keys let load_matcher refuse a checkpoint of any other architecture
-        self.config = dict(vars(args), encoder='ordinal_q', net_nchannel=WIDTH, GNN_layers=LAYERS, attn_heads=HEADS)
+        self.config = dict(vars(args), encoder='ordinal_q_wide', net_nchannel=WIDTH, GNN_layers=LAYERS, attn_heads=HEADS)
         self.dir = os.path.join(args.out_dir, args.dataset, args.name)
         os.makedirs(self.dir, exist_ok=True)
         with open(os.path.join(self.dir, 'config.json'), 'w') as f:
@@ -87,20 +86,22 @@ class Trainer:
 
     def train(self):
         v = self.validate()
-        self.writer.add_scalar('val/avg_inlier_ratio', v, self.start_epoch)
+        self.writer.log('val/avg_inlier_ratio', v, self.start_epoch - 1)          # = after the previous epoch
         for epoch in range(self.start_epoch, self.args.epochs + 1):
             logging.info(f'Epoch {epoch}, LR {self.scheduler.get_last_lr()}')
             self.train_epoch(epoch)
-            self.save(epoch, 'checkpoint')
             self.scheduler.step()
-            if epoch % self.args.val_epoch_freq:
-                continue
-            v = self.validate()
-            self.writer.add_scalar('val/avg_inlier_ratio', v, epoch)
-            if v > self.best_val:
-                self.best_val, self.best_val_epoch = v, epoch
-                self.save(epoch, 'best_val_checkpoint')
-            logging.info(f'best avg_inlier_ratio {self.best_val:.3f} at epoch {self.best_val_epoch}')
+            if epoch % self.args.val_epoch_freq == 0:
+                v = self.validate()
+                self.writer.log('val/avg_inlier_ratio', v, epoch)
+                if v > self.best_val:
+                    self.best_val, self.best_val_epoch = v, epoch
+                    self.save(epoch, 'best_val_checkpoint')
+                logging.info(f'best avg_inlier_ratio {self.best_val:.3f} at epoch {self.best_val_epoch}')
+            # saved LAST, after the scheduler step and the best-val update: a resume continues with the next epoch's
+            # LR and the current best (saved before them, every resume trained one LR step behind and a stale
+            # best_val could let a worse epoch overwrite best_val_checkpoint)
+            self.save(epoch, 'checkpoint')
 
     def save(self, epoch, name):
         torch.save(dict(epoch=epoch, state_dict=self.model.state_dict(), optimizer=self.optimizer.state_dict(),
@@ -110,7 +111,7 @@ class Trainer:
 
     def train_epoch(self, epoch):
         self.model.train()
-        self.train_loader.batch_sampler.start_epoch(epoch)         # live buffer swap BEFORE the workers fork
+        self.train_loader.batch_sampler.set_epoch(epoch)
         it = iter(self.train_loader)
         n_steps = max(1, self.epoch_size // self.args.iter_size)
         self.writer.steps_per_epoch = n_steps
@@ -126,36 +127,37 @@ class Trainer:
                 try:
                     C, p1, p2 = next(it)
                 except StopIteration:
-                    # a bucketed batch overshoots iter_size by up to B-1 samples, so the buffer runs out ~15% early:
-                    # an epoch is one buffer, finish the step with what there is
+                    # a bucketed batch overshoots iter_size by up to B-1 samples, so the draw runs out before n_steps
+                    # (~15% early): finish the step with what there is
                     break
                 t_data += time.perf_counter() - t1
                 C, p1, p2 = (x.to(self.device, non_blocking=True) for x in (C, p1, p2))
                 B = C.shape[0]
-                P, r, c = self.net(p1, p2)
-                loss = total_loss(P, C, r, c, self.args.match_w) * B        # x B: sum over samples at any B
-                if not torch.isnan(loss):
-                    loss.backward()
+                P = self.net(p1, p2)
+                loss = plan_bce(P, C) * B                                    # x B: sum over samples at any B
+                loss.backward()
                 loss_sum += loss.detach()
                 prob_sum += ((1.0 - 2.0 * C) * P.detach()).sum(dim=(-2, -1)).mean() * B
                 n += B
             if n == 0:
-                logging.info(f'epoch {epoch}: buffer exhausted after {step} of {n_steps} steps')
-                return
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-            self.optimizer.step()
+                break
+            # one host sync per step: a non-finite gradient (a NaN sample) skips the step instead of a per-sample check
+            if torch.isfinite(torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)):
+                self.optimizer.step()
+            else:
+                logging.warning(f'epoch {epoch} step {step}: non-finite gradient, step skipped')
             t_all += time.perf_counter() - t0
             if step % 10 == 0:
                 gstep = (epoch - 1) * n_steps + step
-                self.writer.add_scalar('train/total_loss', loss_sum.item(), gstep)
-                self.writer.add_scalar('train/prob_loss', prob_sum.item(), gstep)
+                self.writer.log('train/total_loss', loss_sum.item(), gstep)
+                self.writer.log('train/prob_loss', prob_sum.item(), gstep)
                 k = 1 if step == 0 else 10
+                # prob_loss = sum over the step's pairs of 1 - 2 x (plan mass on GT pairs): lower is better
                 logging.info(f'epoch {epoch} [{step}/{n_steps}] loss {loss_sum.item():.3e} '
-                             f'inlier_prob {prob_sum.item():.3f} data {t_data / k:.4f}s train {(t_all - t_data) / k:.4f}s')
+                             f'prob_loss {prob_sum.item():.3f} data {t_data / k:.4f}s train {(t_all - t_data) / k:.4f}s')
                 t_data = t_all = 0.0
             if n < self.args.iter_size:
-                logging.info(f'epoch {epoch}: buffer exhausted after {step + 1} of {n_steps} steps')
-                return
+                break
 
     @torch.no_grad()
     def validate(self):
@@ -169,7 +171,7 @@ class Trainer:
                 break
             if not 2 <= C.shape[1] <= 3000:
                 continue
-            P = self.net(p1.to(self.device), p2.to(self.device))[0].flatten(1)
+            P = self.net(p1.to(self.device), p2.to(self.device)).flatten(1)
             k = min(100, P.shape[1])
             top = P.topk(k, dim=-1).indices[0]
             ratios.append(float(C.flatten(1)[0, top.cpu()].sum()) / k * 100.0 if k > 3 else 0.0)

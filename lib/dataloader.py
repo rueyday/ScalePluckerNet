@@ -3,12 +3,14 @@ plucker1 = REFERENCE, plucker2 = QUERY, rows [m; d].  No input normalization: th
 
     PairData(folder)        a split written by fullrange_sp5_gen.py, <data_dir>/<dataset>_<split>/{matches,plucker1,
                             plucker2}.pkl, served from a packed memory-mapped copy built next to it once
-    LiveData(epoch_size)    fresh generator pairs every epoch (train.py --live)
     BucketBatchSampler      batches of same-shape pairs (the generator snaps sizes to a grid)
+
+Live generation (a fresh epoch from the generator while the last one trained) was removed 2026-10-29: too much
+overhead (merged pairs 0.17 s each); train on a written split.
 """
+import logging
 import os
 import pickle
-import sys
 
 import numpy as np
 import torch
@@ -17,22 +19,16 @@ from torch.utils.data import Dataset, Sampler
 VARS = {'matches': 1, 'plucker1': 0, 'plucker2': 0}      # variable -> concatenation axis in the packed copy
 PACK = 'packed_v1'
 
-
 def cap_cloud(pl, matches, row, max_n):
-    """Subsample a cloud to <= max_n lines, keeping every line with a GT match on `row` of `matches` (2, n)
-    (0 = plucker1, 1 = plucker2), and reindex the matches."""
+    """Uniformly subsample a cloud to <= max_n lines, as inference does (registration.cap), and keep the GT matches on
+    `row` of `matches` (2, n) (0 = plucker1, 1 = plucker2) whose line survived, reindexed.  Uniform on purpose: the
+    earlier version kept every matched line, so a capped training pair was cleaner than a capped test map (2026-10-29)."""
     n = len(pl)
     if n <= max_n:
         return pl, matches
-    keep = np.unique(matches[row])
-    others = np.setdiff1d(np.arange(n), keep)
-    if max_n > len(keep):
-        sel = np.concatenate([keep, np.random.choice(others, min(len(others), max_n - len(keep)), replace=False)])
-    else:
-        sel = keep[:max_n]                                   # more matched lines than max_n (rare): truncate
-    sel.sort()
+    sel = np.sort(np.random.choice(n, max_n, replace=False))
     remap = -np.ones(n, np.int64)
-    remap[sel] = np.arange(len(sel))
+    remap[sel] = np.arange(max_n)
     m = matches.copy()
     m[row] = remap[m[row]]
     return pl[sel], m[:, m[row] >= 0]
@@ -56,11 +52,7 @@ class _Ragged:
 
 
 def _pack(folder):
-    """<folder>/packed_v1 from the per-variable pickles, one variable at a time (peak ~2x the largest one).
-
-    Why (2026-10-26, v103): a list of 120k small arrays is millions of Python objects; every forked DataLoader worker
-    touches their refcounts, copy-on-write duplicates the pages, and 7 GB of data OOM-killed the trainer 6x under a
-    20 GB cap.  A memory map is shared page cache: no copies, reclaimable."""
+    """<folder>/packed_v1 from the per-variable pickles, one variable at a time """
     out, tmp = os.path.join(folder, PACK), os.path.join(folder, PACK + '.tmp')
     os.makedirs(tmp, exist_ok=True)
     for var, ax in VARS.items():
@@ -73,17 +65,15 @@ def _pack(folder):
 
 
 class PairData(Dataset):
-    def __init__(self, folder=None, max_lines=6000):
+    def __init__(self, folder, max_lines=6000):
         self.max_lines = max_lines
-        if folder is None:                                   # LiveData fills self.data itself
-            return
         pk = os.path.join(folder, PACK)
         if not os.path.isdir(pk):
-            print(f'packing {folder} -> {PACK} (once)', flush=True)
+            logging.info(f'packing {folder} -> {PACK} (once)')
             _pack(folder)
         self.data = {v: _Ragged(np.load(os.path.join(pk, f'{v}.npy'), mmap_mode='r'),
                                 np.load(os.path.join(pk, f'{v}_off.npy')), ax) for v, ax in VARS.items()}
-        print(f'{folder}: {len(self)} pairs', flush=True)
+        logging.info(f'{folder}: {len(self)} pairs')
 
     def __len__(self):
         return len(self.data['plucker1'])
@@ -100,10 +90,7 @@ class PairData(Dataset):
 
     def shapes(self):
         """(n1, n2) per pair, before the cap, for BucketBatchSampler."""
-        p1, p2 = self.data['plucker1'], self.data['plucker2']
-        if isinstance(p1, _Ragged):
-            return list(zip(p1.lengths().tolist(), p2.lengths().tolist()))
-        return [(len(a), len(b)) for a, b in zip(p1, p2)]
+        return list(zip(self.data['plucker1'].lengths().tolist(), self.data['plucker2'].lengths().tolist()))
 
 
 def collate(batch):
@@ -111,51 +98,9 @@ def collate(batch):
     return tuple(torch.stack(x) for x in zip(*batch))
 
 
-# ---- live generation ----
-# A fixed set is re-seen 25x (300k pairs) to 154x (50k) over a 200-epoch run, and v63 measured the cost (the 50k subset
-# trailed the 300k parent by ~2 points, widening).  Live pairs never repeat and need no dataset in RAM.  One epoch is
-# buffered (the sampler needs every shape up front) while the next one is generated in the background.
-
-def _seed_worker(seed):
-    np.random.seed((seed * 7919 + os.getpid()) % (2 ** 32))
-
-
-def _generate(_):
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    if root not in sys.path:
-        sys.path.insert(0, root)
-    from fullrange_sp5_gen import generate_pair
-    d = generate_pair()
-    return d['matches'], d['plucker1'], d['plucker2']
-
-
-class LiveData(PairData):
-    def __init__(self, epoch_size, workers=8, seed=0, max_lines=6000):
-        super().__init__(None, max_lines)
-        import multiprocessing as mp
-        self.epoch_size = int(epoch_size)
-        self._pool = mp.get_context('spawn').Pool(workers, initializer=_seed_worker, initargs=(seed,))
-        # imap, not map: map materialises the whole 32000-pair result in the parent next to the buffer
-        self._fill(list(self._pool.imap_unordered(_generate, range(self.epoch_size), chunksize=64)))
-        self._next = None
-
-    def _fill(self, rows):
-        self.data = dict(zip(('matches', 'plucker1', 'plucker2'), map(list, zip(*rows))))
-
-    def next_epoch(self):
-        """Swap in the prefetched epoch (the first epoch was made by the constructor) and start the next one.
-        map_async, not a Python thread: a thread collecting imap results holds the GIL and does not overlap training
-        (measured 14.7 vs 9.6 min/epoch)."""
-        if self._next is not None:
-            self._fill(self._next.get())
-        self._next = self._pool.map_async(_generate, range(self.epoch_size), chunksize=64)
-
-
 class BucketBatchSampler(Sampler):
     """Batches of same-shape (n1, n2) pairs.  Batch size max(1, min(max_b, budget // n, mem_budget // n^2)),
-    n = max(n1, n2): attention is O(B n^2), so the quadratic cap keeps large clouds alone (measured on the RTX 5090:
-    n=512 gains +52% going B 8 -> 32, n=1094 gains nothing, n>=2460 would OOM).  Each epoch draws epoch_size pairs
-    without replacement and shuffles the batch order."""
+    n = max(n1, n2): attention is O(B n^2). Each epoch draws pairs without replacement and shuffles the order."""
 
     def __init__(self, dataset, epoch_size, budget=16384, max_b=32, mem_budget=8400000, seed=0):
         self.dataset, self.seed, self.epoch = dataset, seed, 0
@@ -170,15 +115,9 @@ class BucketBatchSampler(Sampler):
             b = min(b, self.mem_budget // (n * n))
         return max(1, b)
 
-    def start_epoch(self, epoch):
-        """Call ONCE per epoch, BEFORE iter(loader).  The live buffer swap must not happen in __iter__: DataLoader
-        calls iter(sampler) twice per iter(loader), once before forking its workers and once after, so a swap there
-        reached the parent only and the workers served the OLD buffer at indices bucketed by the NEW shapes (the v83
-        OOM, 2026-09-29).  __iter__ is a pure function of (shapes, epoch)."""
+    def set_epoch(self, epoch):
+        """Call before iter(loader); the epoch seeds that epoch's draw (__iter__ is a pure function of it)."""
         self.epoch = int(epoch)
-        if isinstance(self.dataset, LiveData):
-            self.dataset.next_epoch()
-            self.shapes = self.dataset.shapes()
 
     def __iter__(self):
         rng = np.random.default_rng(self.seed + self.epoch)
